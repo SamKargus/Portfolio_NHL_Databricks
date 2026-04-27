@@ -42,7 +42,7 @@ GAME_SCORES      = f"{_BASE}/bronze/game_scores"
 PLAYERS          = f"{_BASE}/bronze/players"
 
 CHECKPOINT_BASE  = f"{_BASE}/checkpoints/bronze"
-TRIGGER_SECS     = 10
+TRIGGER_AVAILABLE_NOW = True  # serverless only supports AvailableNow/Once, not ProcessingTime
 
 
 # ── Schemas ────────────────────────────────────────────────────────────────────
@@ -236,7 +236,7 @@ def main():
         .writeStream
         .foreachBatch(write_events_batch)
         .option("checkpointLocation", f"{CHECKPOINT_BASE}/game_events")
-        .trigger(processingTime=f"{TRIGGER_SECS} seconds")
+        .trigger(availableNow=True)
         .queryName("bronze_game_events")
         .start()
     )
@@ -247,7 +247,7 @@ def main():
         .writeStream
         .foreachBatch(write_stats_batch)
         .option("checkpointLocation", f"{CHECKPOINT_BASE}/player_stats")
-        .trigger(processingTime=f"{TRIGGER_SECS} seconds")
+        .trigger(availableNow=True)
         .queryName("bronze_player_stats")
         .start()
     )
@@ -258,7 +258,7 @@ def main():
         .writeStream
         .foreachBatch(write_game_state_batch)
         .option("checkpointLocation", f"{CHECKPOINT_BASE}/game_state")
-        .trigger(processingTime=f"{TRIGGER_SECS} seconds")
+        .trigger(availableNow=True)
         .queryName("bronze_game_state")
         .start()
     )
@@ -269,11 +269,14 @@ def main():
         .writeStream
         .foreachBatch(write_players_batch)
         .option("checkpointLocation", f"{CHECKPOINT_BASE}/players")
-        .trigger(processingTime=f"{TRIGGER_SECS} seconds")
+        .trigger(availableNow=True)
         .queryName("bronze_players")
         .start()
     )
     log.info("Players stream: %s", players_q.id)
+
+    for q in [events_q, stats_q, state_q, players_q]:
+        q.awaitTermination()
 
     # Register tables in metastore for Databricks SQL access
     for name, path in [
@@ -283,8 +286,6 @@ def main():
         ("players",             PLAYERS),
     ]:
         register_table(spark, name, path)
-
-    spark.streams.awaitAnyTermination()
 
 
 main()
