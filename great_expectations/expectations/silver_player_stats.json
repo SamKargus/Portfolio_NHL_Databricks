@@ -1,0 +1,99 @@
+{
+  "expectations": [
+    {
+      "id": "74b3de19-c7f0-4f80-8afb-44a6e8a1cfc9",
+      "kwargs": {
+        "column": "player_id"
+      },
+      "meta": {},
+      "severity": "critical",
+      "type": "expect_column_values_to_not_be_null"
+    },
+    {
+      "id": "5050c12f-0d34-4552-b39e-ff85838b21b8",
+      "kwargs": {
+        "column": "game_id"
+      },
+      "meta": {},
+      "severity": "critical",
+      "type": "expect_column_values_to_not_be_null"
+    },
+    {
+      "id": "a73386f4-29f4-43e2-8126-6d77958c980b",
+      "kwargs": {
+        "column": "team_id"
+      },
+      "meta": {},
+      "severity": "critical",
+      "type": "expect_column_values_to_not_be_null"
+    },
+    {
+      "id": "3885a50e-5e29-4947-ae39-c2afea0496e0",
+      "kwargs": {
+        "column": "position",
+        "mostly": 0.99,
+        "value_set": [
+          "C",
+          "L",
+          "R",
+          "D",
+          "G"
+        ]
+      },
+      "meta": {},
+      "severity": "critical",
+      "type": "expect_column_values_to_be_in_set"
+    },
+    {
+      "id": "d5f7f802-88d8-4f07-8c1d-2af0347c35b8",
+      "kwargs": {
+        "column": "goals",
+        "max_value": 10.0,
+        "min_value": 0.0
+      },
+      "meta": {},
+      "severity": "critical",
+      "type": "expect_column_values_to_be_between"
+    },
+    {
+      "id": "8cc58965-353b-4837-a27c-7b1618af5020",
+      "kwargs": {
+        "column": "assists",
+        "max_value": 10.0,
+        "min_value": 0.0
+      },
+      "meta": {},
+      "severity": "critical",
+      "type": "expect_column_values_to_be_between"
+    },
+    {
+      "id": "d10f1538-f5d7-4b2f-969b-fb6083746abb",
+      "kwargs": {
+        "column": "shots",
+        "max_value": 20.0,
+        "min_value": 0.0
+      },
+      "meta": {},
+      "severity": "critical",
+      "type": "expect_column_values_to_be_between"
+    },
+    {
+      "id": "a88262ae-b6fc-4962-8542-66fceb87543b",
+      "kwargs": {
+        "column": "faceoff_pct",
+        "max_value": 100.0,
+        "min_value": 0.0,
+        "mostly": 0.99
+      },
+      "meta": {},
+      "severity": "critical",
+      "type": "expect_column_values_to_be_between"
+    }
+  ],
+  "id": "76b6a63f-0e4b-4b65-8343-d6a33d3b94ec",
+  "meta": {
+    "great_expectations_version": "1.16.1"
+  },
+  "name": "silver_player_stats",
+  "notes": null
+}

@@ -1,0 +1,42 @@
+nhl_api:
+  base_url: "https://api-web.nhle.com/v1"
+  poll_interval_seconds: 5
+  rate_limit_requests_per_minute: 60
+  timeout_seconds: 10
+  max_retries: 3
+
+databricks:
+  workspace_url: "${DATABRICKS_HOST}"
+  token: "${DATABRICKS_TOKEN}"
+  cluster_id: "${DATABRICKS_CLUSTER_ID}"
+  streaming_job_id: "${DATABRICKS_STREAMING_JOB_ID}"
+  batch_job_id: "${DATABRICKS_BATCH_JOB_ID}"
+  api_version: "2.1"
+
+delta_lake:
+  bronze_path: "dbfs:/mnt/nhl/bronze"
+  silver_path: "dbfs:/mnt/nhl/silver"
+  gold_path: "dbfs:/mnt/nhl/gold"
+  historical_path: "dbfs:/mnt/nhl/historical"
+  checkpoint_base: "dbfs:/mnt/nhl/checkpoints"
+
+streaming:
+  trigger_interval_seconds: 10
+  max_offsets_per_trigger: 10000
+  watermark_delay_minutes: 5
+
+batch:
+  schedule_cron: "0 4 * * *"             # 4 AM daily
+  lookback_days: 1
+
+logging:
+  level: "INFO"
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  file: "logs/nhl_pipeline.log"
+  max_bytes: 10485760                    # 10 MB
+  backup_count: 5
+
+great_expectations:
+  context_dir: "great_expectations"
+  suite_name: "nhl_pipeline_suite"
+  datasource_name: "nhl_delta_datasource"

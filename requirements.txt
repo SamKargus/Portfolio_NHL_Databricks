@@ -1,0 +1,21 @@
+# ── Core ───────────────────────────────────────────────────────────────────────
+requests>=2.31.0
+urllib3>=2.0.0
+pyyaml>=6.0.1
+python-dotenv>=1.0.0
+
+# ── Databricks SQL connector (dashboard ↔ Databricks SQL warehouse) ────────────
+databricks-sql-connector[sqlalchemy]>=3.0.0
+
+# ── Data quality ───────────────────────────────────────────────────────────────
+great-expectations>=0.18.0
+
+# ── PySpark + Delta (local dev / unit tests — Databricks provides its own runtime) ─
+pyspark==4.0.0
+delta-spark==4.0.0
+
+# ── Development & testing ───────────────────────────────────────────────────────
+pytest>=7.4.0
+pytest-mock>=3.12.0
+black>=24.0.0
+ruff>=0.3.0

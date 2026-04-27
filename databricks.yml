@@ -1,0 +1,151 @@
+bundle:
+  name: nhl-pipeline
+
+variables:
+  delta_base:
+    description: DBFS root for all Delta tables and landing files
+    default: dbfs:/mnt/nhl
+  landing_base:
+    description: Local /dbfs path used by the producer to write NDJSON files
+    default: /dbfs/mnt/nhl/landing
+  databricks_catalog:
+    description: Unity Catalog catalog name (hive_metastore for legacy)
+    default: hive_metastore
+  databricks_schema:
+    description: Schema / database name inside the catalog
+    default: nhl
+
+targets:
+  dev:
+    mode: development
+    default: true
+
+  prod:
+    mode: production
+
+
+# ── Shared cluster config ──────────────────────────────────────────────────────
+# All streaming jobs use the same small multi-node cluster.
+# The producer runs as a single-node Python task (no Spark needed).
+_cluster_streaming: &cluster_streaming
+  spark_version: 15.4.x-scala2.12
+  node_type_id: i3.xlarge
+  num_workers: 2
+  spark_env_vars:
+    DELTA_BASE: ${var.delta_base}
+    DATABRICKS_CATALOG: ${var.databricks_catalog}
+    DATABRICKS_SCHEMA: ${var.databricks_schema}
+  spark_conf:
+    spark.databricks.delta.autoCompact.enabled: "true"
+    spark.databricks.delta.optimizeWrite.enabled: "true"
+
+
+resources:
+  jobs:
+
+    # ── 1. NHL API Producer (continuous) ────────────────────────────────────────
+    nhl_producer:
+      name: NHL API Producer
+      description: Polls NHL live API every 5 s and writes NDJSON landing files to DBFS
+      tasks:
+        - task_key: producer
+          python_wheel_task:
+            package_name: nhl_pipeline
+            entry_point: nhl_api_producer
+          job_cluster_key: producer_cluster
+          libraries:
+            - pypi:
+                package: requests>=2.31.0
+            - pypi:
+                package: pyyaml>=6.0.1
+            - pypi:
+                package: python-dotenv>=1.0.0
+      job_clusters:
+        - job_cluster_key: producer_cluster
+          new_cluster:
+            spark_version: 15.4.x-scala2.12
+            node_type_id: m5.large
+            num_workers: 0
+            spark_env_vars:
+              LANDING_BASE: ${var.landing_base}
+              DELTA_BASE: ${var.delta_base}
+      continuous:
+        pause_status: UNPAUSED
+      max_concurrent_runs: 1
+
+    # ── 2. Streaming pipeline (continuous, three parallel tasks) ─────────────────
+    nhl_streaming_pipeline:
+      name: NHL Streaming Pipeline
+      description: Auto Loader → Bronze → Silver → Gold Delta pipeline
+      tasks:
+        - task_key: bronze
+          spark_python_task:
+            python_file: src/streaming/bronze_streaming.py
+          job_cluster_key: streaming_cluster
+          libraries:
+            - pypi:
+                package: delta-spark==4.0.0
+
+        - task_key: silver
+          spark_python_task:
+            python_file: src/streaming/silver_streaming.py
+          depends_on:
+            - task_key: bronze
+          job_cluster_key: streaming_cluster
+          libraries:
+            - pypi:
+                package: delta-spark==4.0.0
+
+        - task_key: gold
+          spark_python_task:
+            python_file: src/streaming/gold_streaming.py
+          depends_on:
+            - task_key: silver
+          job_cluster_key: streaming_cluster
+          libraries:
+            - pypi:
+                package: delta-spark==4.0.0
+
+      job_clusters:
+        - job_cluster_key: streaming_cluster
+          new_cluster:
+            <<: *cluster_streaming
+
+      continuous:
+        pause_status: UNPAUSED
+      max_concurrent_runs: 1
+
+    # ── 3. Nightly batch job (cron at 04:00 UTC) ─────────────────────────────────
+    nhl_nightly_batch:
+      name: NHL Nightly Batch
+      description: Backfills any gaps from silver Delta; updates historical gold tables
+      tasks:
+        - task_key: nightly_batch
+          spark_python_task:
+            python_file: src/batch/nightly_batch_job.py
+            parameters:
+              - "--seasons"
+              - "20242025"
+          job_cluster_key: batch_cluster
+          libraries:
+            - pypi:
+                package: delta-spark==4.0.0
+            - pypi:
+                package: requests>=2.31.0
+
+      job_clusters:
+        - job_cluster_key: batch_cluster
+          new_cluster:
+            spark_version: 15.4.x-scala2.12
+            node_type_id: m5.xlarge
+            num_workers: 4
+            spark_env_vars:
+              DELTA_BASE: ${var.delta_base}
+              DATABRICKS_CATALOG: ${var.databricks_catalog}
+              DATABRICKS_SCHEMA: ${var.databricks_schema}
+
+      schedule:
+        quartz_cron_expression: "0 0 4 * * ?"
+        timezone_id: UTC
+        pause_status: UNPAUSED
+      max_concurrent_runs: 1
