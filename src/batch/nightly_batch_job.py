@@ -17,7 +17,8 @@ from pathlib import Path
 from delta.tables import DeltaTable
 from pyspark.sql import functions as F
 
-sys.path.insert(0, str(Path(__file__).parents[2]))
+_f = globals().get("__file__") or sys._getframe(0).f_code.co_filename
+sys.path.insert(0, str(Path(_f).parents[2]))
 from src.utils.delta import ensure_schema, register_table
 
 logging.basicConfig(level=logging.INFO)
