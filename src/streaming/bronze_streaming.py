@@ -23,7 +23,7 @@ from pyspark.sql.types import (
 _f = globals().get("__file__") or sys._getframe(0).f_code.co_filename; sys.path.insert(0, str(__import__("pathlib").Path(_f).parents[2]))
 from src.utils.delta import (
     DB_CATALOG, DB_SCHEMA,
-    ensure_schema, merge_into_delta, register_table,
+    ensure_schema, register_table,
 )
 
 logging.basicConfig(level=logging.INFO, stream=sys.stdout)
@@ -143,6 +143,22 @@ PLAYER_SCHEMA = StructType([
 ])
 
 
+# ── Inline upsert (avoids cloudpickle re-importing src.utils.delta in workers) ─
+def _upsert(batch_df, path, merge_keys, update_cols=None):
+    from delta.tables import DeltaTable as _DT
+    ss = batch_df.sparkSession
+    if not _DT.isDeltaTable(ss, path):
+        batch_df.write.format("delta").mode("append").save(path)
+        return
+    condition = " AND ".join(f"t.{k} = s.{k}" for k in merge_keys)
+    merger = _DT.forPath(ss, path).alias("t").merge(batch_df.alias("s"), condition)
+    if update_cols:
+        merger = merger.whenMatchedUpdate(set={c: f"s.{c}" for c in update_cols})
+    else:
+        merger = merger.whenMatchedUpdateAll()
+    merger.whenNotMatchedInsertAll().execute()
+
+
 # ── Auto Loader helper ─────────────────────────────────────────────────────────
 def _autoloader_stream(path: str, schema: StructType, file_format: str = "json"):
     return (
@@ -172,23 +188,14 @@ _EVENT_UPDATE_COLS = [
 def write_events_batch(batch_df, epoch_id):
     if batch_df.rdd.isEmpty():
         return
-    merge_into_delta(
-        spark, BRONZE_EVENTS, batch_df,
-        merge_keys=["event_id", "game_id"],
-        update_cols=_EVENT_UPDATE_COLS,
-    )
+    _upsert(batch_df, BRONZE_EVENTS, ["event_id", "game_id"], _EVENT_UPDATE_COLS)
     log.info("Bronze events batch %d: %d rows → Delta", epoch_id, batch_df.count())
 
 
 def write_stats_batch(batch_df, epoch_id):
     if batch_df.rdd.isEmpty():
         return
-    # Stats are a snapshot per poll cycle — keep the latest by upserting on stat_id
-    merge_into_delta(
-        spark, BRONZE_STATS, batch_df,
-        merge_keys=["stat_id"],
-        update_cols=None,  # update all columns
-    )
+    _upsert(batch_df, BRONZE_STATS, ["stat_id"])
     log.info("Bronze stats batch %d: %d rows → Delta", epoch_id, batch_df.count())
 
 
@@ -206,22 +213,15 @@ def write_game_state_batch(batch_df, epoch_id):
         .filter(F.col("_rn") == 1)
         .drop("_rn")
     )
-    merge_into_delta(
-        spark, GAME_SCORES, latest,
-        merge_keys=["game_id"],
-        update_cols=None,
-    )
+    _upsert(latest, GAME_SCORES, ["game_id"])
     log.info("Game state batch %d → Delta", epoch_id)
 
 
 def write_players_batch(batch_df, epoch_id):
     if batch_df.rdd.isEmpty():
         return
-    merge_into_delta(
-        spark, PLAYERS, batch_df,
-        merge_keys=["player_id"],
-        update_cols=["full_name", "first_name", "last_name", "position", "team_id"],
-    )
+    _upsert(batch_df, PLAYERS, ["player_id"],
+            ["full_name", "first_name", "last_name", "position", "team_id"])
     log.info("Players batch %d: %d rows → Delta", epoch_id, batch_df.count())
 
 

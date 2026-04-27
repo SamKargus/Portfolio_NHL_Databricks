@@ -15,7 +15,7 @@ from pyspark.sql.types import IntegerType
 _f = globals().get("__file__") or sys._getframe(0).f_code.co_filename; sys.path.insert(0, str(__import__("pathlib").Path(_f).parents[2]))
 from src.utils.delta import (
     DB_CATALOG, DB_SCHEMA,
-    ensure_schema, merge_into_delta, register_table,
+    ensure_schema, register_table,
 )
 
 logging.basicConfig(level=logging.INFO, stream=sys.stdout)
@@ -98,6 +98,22 @@ def transform_stats(df):
     )
 
 
+# ── Inline upsert (avoids cloudpickle re-importing src.utils.delta in workers) ─
+def _upsert(batch_df, path, merge_keys, update_cols=None):
+    from delta.tables import DeltaTable as _DT
+    ss = batch_df.sparkSession
+    if not _DT.isDeltaTable(ss, path):
+        batch_df.write.format("delta").mode("append").save(path)
+        return
+    condition = " AND ".join(f"t.{k} = s.{k}" for k in merge_keys)
+    merger = _DT.forPath(ss, path).alias("t").merge(batch_df.alias("s"), condition)
+    if update_cols:
+        merger = merger.whenMatchedUpdate(set={c: f"s.{c}" for c in update_cols})
+    else:
+        merger = merger.whenMatchedUpdateAll()
+    merger.whenNotMatchedInsertAll().execute()
+
+
 # ── foreachBatch writers ───────────────────────────────────────────────────────
 _EVENT_SILVER_COLS = [
     "event_id", "game_id", "season", "game_type", "event_type",
@@ -132,22 +148,14 @@ def write_events_batch(batch_df, epoch_id):
     if batch_df.rdd.isEmpty():
         return
     out = batch_df.select(*[c for c in _EVENT_SILVER_COLS if c in batch_df.columns])
-    merge_into_delta(
-        spark, SILVER_EVENTS, out,
-        merge_keys=["event_id", "game_id"],
-        update_cols=_EVENT_UPDATE_COLS,
-    )
+    _upsert(out, SILVER_EVENTS, ["event_id", "game_id"], _EVENT_UPDATE_COLS)
     log.info("Silver events batch %d → Delta", epoch_id)
 
 
 def write_stats_batch(batch_df, epoch_id):
     if batch_df.rdd.isEmpty():
         return
-    merge_into_delta(
-        spark, SILVER_STATS, batch_df,
-        merge_keys=["stat_id"],
-        update_cols=None,
-    )
+    _upsert(batch_df, SILVER_STATS, ["stat_id"])
     log.info("Silver stats batch %d → Delta", epoch_id)
 
 

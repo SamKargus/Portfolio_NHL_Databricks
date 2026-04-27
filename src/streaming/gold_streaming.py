@@ -12,7 +12,7 @@ from pyspark.sql import functions as F
 
 _f = globals().get("__file__") or sys._getframe(0).f_code.co_filename; sys.path.insert(0, str(__import__("pathlib").Path(_f).parents[2]))
 from src.utils.delta import (
-    ensure_schema, merge_into_delta, register_table,
+    ensure_schema, register_table,
 )
 
 logging.basicConfig(level=logging.INFO, stream=sys.stdout)
@@ -27,6 +27,22 @@ GOLD_PENALTIES   = f"{_BASE}/gold/penalty_summary"
 CHECKPOINT_BASE  = f"{_BASE}/checkpoints/gold"
 TRIGGER_SECS     = 30
 WATERMARK_DELAY  = "10 minutes"
+
+
+# ── Inline upsert (avoids cloudpickle re-importing src.utils.delta in workers) ─
+def _upsert(batch_df, path, merge_keys, update_cols=None):
+    from delta.tables import DeltaTable as _DT
+    ss = batch_df.sparkSession
+    if not _DT.isDeltaTable(ss, path):
+        batch_df.write.format("delta").mode("append").save(path)
+        return
+    condition = " AND ".join(f"t.{k} = s.{k}" for k in merge_keys)
+    merger = _DT.forPath(ss, path).alias("t").merge(batch_df.alias("s"), condition)
+    if update_cols:
+        merger = merger.whenMatchedUpdate(set={c: f"s.{c}" for c in update_cols})
+    else:
+        merger = merger.whenMatchedUpdateAll()
+    merger.whenNotMatchedInsertAll().execute()
 
 
 # ── Stream builder ─────────────────────────────────────────────────────────────
@@ -87,12 +103,9 @@ def build_player_scoring(stream):
 def write_scoring_batch(batch_df, epoch_id):
     if batch_df.rdd.isEmpty():
         return
-    merge_into_delta(
-        spark, GOLD_SCORING, batch_df,
-        merge_keys=["game_id", "player_id"],
-        update_cols=["goals", "primary_assists", "secondary_assists",
-                     "total_assists", "points", "last_event_at", "gold_updated_at"],
-    )
+    _upsert(batch_df, GOLD_SCORING, ["game_id", "player_id"],
+            ["goals", "primary_assists", "secondary_assists",
+             "total_assists", "points", "last_event_at", "gold_updated_at"])
     log.info("Gold scoring batch %d → Delta", epoch_id)
 
 
@@ -129,11 +142,8 @@ def build_team_momentum(stream):
 def write_momentum_batch(batch_df, epoch_id):
     if batch_df.rdd.isEmpty():
         return
-    merge_into_delta(
-        spark, GOLD_MOMENTUM, batch_df,
-        merge_keys=["game_id", "team_abbrev", "window_start"],
-        update_cols=["window_end", "momentum_score", "gold_updated_at"],
-    )
+    _upsert(batch_df, GOLD_MOMENTUM, ["game_id", "team_abbrev", "window_start"],
+            ["window_end", "momentum_score", "gold_updated_at"])
     log.info("Gold momentum batch %d → Delta", epoch_id)
 
 
@@ -157,12 +167,9 @@ def build_penalty_summary(stream):
 def write_penalty_batch(batch_df, epoch_id):
     if batch_df.rdd.isEmpty():
         return
-    merge_into_delta(
-        spark, GOLD_PENALTIES, batch_df,
-        merge_keys=["game_id", "penalty_type"],
-        update_cols=["penalty_count", "total_penalty_minutes",
-                     "unique_offenders", "last_penalty_at", "gold_updated_at"],
-    )
+    _upsert(batch_df, GOLD_PENALTIES, ["game_id", "penalty_type"],
+            ["penalty_count", "total_penalty_minutes",
+             "unique_offenders", "last_penalty_at", "gold_updated_at"])
     log.info("Gold penalty batch %d → Delta", epoch_id)
 
 
