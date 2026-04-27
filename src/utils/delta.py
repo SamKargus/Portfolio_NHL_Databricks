@@ -8,18 +8,22 @@ import os
 from delta.tables import DeltaTable
 from pyspark.sql import DataFrame, SparkSession
 
-DB_CATALOG = os.getenv("DATABRICKS_CATALOG", "hive_metastore")
+DB_CATALOG = os.getenv("DATABRICKS_CATALOG", "")  # empty = use session's current catalog
 DB_SCHEMA  = os.getenv("DATABRICKS_SCHEMA",  "nhl")
 
 
+def _catalog(spark: SparkSession) -> str:
+    return DB_CATALOG if DB_CATALOG else spark.catalog.currentCatalog()
+
+
 def ensure_schema(spark: SparkSession) -> None:
-    spark.sql(f"CREATE DATABASE IF NOT EXISTS {DB_CATALOG}.{DB_SCHEMA}")
+    spark.sql(f"CREATE SCHEMA IF NOT EXISTS {_catalog(spark)}.{DB_SCHEMA}")
 
 
 def register_table(spark: SparkSession, table_name: str, path: str) -> None:
     """Register a Delta path in the metastore so Databricks SQL can query it by name."""
     spark.sql(f"""
-        CREATE TABLE IF NOT EXISTS {DB_CATALOG}.{DB_SCHEMA}.{table_name}
+        CREATE TABLE IF NOT EXISTS {_catalog(spark)}.{DB_SCHEMA}.{table_name}
         USING DELTA LOCATION '{path}'
     """)
 
