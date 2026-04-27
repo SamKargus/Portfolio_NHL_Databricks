@@ -17,14 +17,14 @@ from pathlib import Path
 from delta.tables import DeltaTable
 from pyspark.sql import functions as F
 
-sys.path.insert(0, "/Workspace/Repos/nhl-pipeline")
+sys.path.insert(0, str(Path(__file__).parents[2]))
 from src.utils.delta import ensure_schema, register_table
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("nightly_batch")
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
-_BASE               = os.getenv("DELTA_BASE", "dbfs:/mnt/nhl")
+_BASE               = os.getenv("DELTA_BASE", "dbfs:/nhl")
 SILVER_EVENTS       = f"{_BASE}/silver/game_events"
 SILVER_STATS        = f"{_BASE}/silver/player_stats"
 HIST_PLAYER_SEASON  = f"{_BASE}/historical/player_season_stats"

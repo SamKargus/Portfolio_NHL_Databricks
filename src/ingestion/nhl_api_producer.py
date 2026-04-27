@@ -50,7 +50,7 @@ def load_config() -> dict:
 
 
 # ── DBFS landing paths (Python file I/O uses /dbfs/ prefix on Databricks) ──────
-_LANDING_BASE       = os.getenv("LANDING_BASE", "/dbfs/mnt/nhl/landing")
+_LANDING_BASE       = os.getenv("LANDING_BASE", "/dbfs/nhl/landing")
 LANDING_EVENTS      = f"{_LANDING_BASE}/game_events"
 LANDING_STATS       = f"{_LANDING_BASE}/player_stats"
 LANDING_GAME_STATE  = f"{_LANDING_BASE}/game_state"

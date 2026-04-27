@@ -12,7 +12,7 @@ import sys
 from pyspark.sql import functions as F
 from pyspark.sql.types import IntegerType
 
-sys.path.insert(0, "/Workspace/Repos/nhl-pipeline")
+sys.path.insert(0, str(__import__("pathlib").Path(__file__).parents[2]))
 from src.utils.delta import (
     DB_CATALOG, DB_SCHEMA,
     ensure_schema, merge_into_delta, register_table,
@@ -22,7 +22,7 @@ logging.basicConfig(level=logging.INFO, stream=sys.stdout)
 log = logging.getLogger("silver_streaming")
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
-_BASE           = os.getenv("DELTA_BASE", "dbfs:/mnt/nhl")
+_BASE           = os.getenv("DELTA_BASE", "dbfs:/nhl")
 BRONZE_EVENTS   = f"{_BASE}/bronze/game_events"
 BRONZE_STATS    = f"{_BASE}/bronze/player_stats"
 SILVER_EVENTS   = f"{_BASE}/silver/game_events"

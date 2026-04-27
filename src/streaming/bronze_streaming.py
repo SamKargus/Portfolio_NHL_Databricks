@@ -20,7 +20,7 @@ from pyspark.sql.types import (
     StringType, StructField, StructType,
 )
 
-sys.path.insert(0, "/Workspace/Repos/nhl-pipeline")
+sys.path.insert(0, str(__import__("pathlib").Path(__file__).parents[2]))
 from src.utils.delta import (
     DB_CATALOG, DB_SCHEMA,
     ensure_schema, merge_into_delta, register_table,
@@ -30,7 +30,7 @@ logging.basicConfig(level=logging.INFO, stream=sys.stdout)
 log = logging.getLogger("bronze_streaming")
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
-_BASE            = os.getenv("DELTA_BASE", "dbfs:/mnt/nhl")
+_BASE            = os.getenv("DELTA_BASE", "dbfs:/nhl")
 LANDING_EVENTS   = f"{_BASE}/landing/game_events"
 LANDING_STATS    = f"{_BASE}/landing/player_stats"
 LANDING_STATE    = f"{_BASE}/landing/game_state"
