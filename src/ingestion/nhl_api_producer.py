@@ -37,7 +37,8 @@ log = logging.getLogger("nhl_producer")
 # ── Config ─────────────────────────────────────────────────────────────────────
 def load_config() -> dict:
     import re
-    config_path = Path(__file__).parents[2] / "config" / "config.yaml"
+    _this = globals().get("__file__") or sys._getframe(0).f_code.co_filename
+    config_path = Path(_this).parents[2] / "config" / "config.yaml"
     with open(config_path) as f:
         raw = f.read()
     def _expand(m):
@@ -49,8 +50,9 @@ def load_config() -> dict:
     return yaml.safe_load(raw)
 
 
-# ── DBFS landing paths (Python file I/O uses /dbfs/ prefix on Databricks) ──────
-_LANDING_BASE       = os.getenv("LANDING_BASE", "/dbfs/nhl/landing")
+# ── Landing paths (Unity Catalog Volume, auto-detected when env var not set) ────
+_uc_base      = f"/Volumes/{spark.catalog.currentCatalog()}/nhl/nhl_data"
+_LANDING_BASE = os.getenv("LANDING_BASE") or f"{_uc_base}/landing"
 LANDING_EVENTS      = f"{_LANDING_BASE}/game_events"
 LANDING_STATS       = f"{_LANDING_BASE}/player_stats"
 LANDING_GAME_STATE  = f"{_LANDING_BASE}/game_state"

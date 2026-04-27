@@ -22,7 +22,7 @@ logging.basicConfig(level=logging.INFO, stream=sys.stdout)
 log = logging.getLogger("silver_streaming")
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
-_BASE           = os.getenv("DELTA_BASE", "dbfs:/nhl")
+_BASE = os.getenv("DELTA_BASE") or f"/Volumes/{spark.catalog.currentCatalog()}/nhl/nhl_data"
 BRONZE_EVENTS   = f"{_BASE}/bronze/game_events"
 BRONZE_STATS    = f"{_BASE}/bronze/player_stats"
 SILVER_EVENTS   = f"{_BASE}/silver/game_events"

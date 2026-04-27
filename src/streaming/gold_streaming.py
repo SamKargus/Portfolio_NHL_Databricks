@@ -19,7 +19,7 @@ logging.basicConfig(level=logging.INFO, stream=sys.stdout)
 log = logging.getLogger("gold_streaming")
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
-_BASE            = os.getenv("DELTA_BASE", "dbfs:/nhl")
+_BASE = os.getenv("DELTA_BASE") or f"/Volumes/{spark.catalog.currentCatalog()}/nhl/nhl_data"
 SILVER_EVENTS    = f"{_BASE}/silver/game_events"
 GOLD_SCORING     = f"{_BASE}/gold/player_scoring"
 GOLD_MOMENTUM    = f"{_BASE}/gold/team_momentum"

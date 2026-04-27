@@ -25,7 +25,7 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("nightly_batch")
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
-_BASE               = os.getenv("DELTA_BASE", "dbfs:/nhl")
+_BASE = os.getenv("DELTA_BASE") or f"/Volumes/{spark.catalog.currentCatalog()}/nhl/nhl_data"
 SILVER_EVENTS       = f"{_BASE}/silver/game_events"
 SILVER_STATS        = f"{_BASE}/silver/player_stats"
 HIST_PLAYER_SEASON  = f"{_BASE}/historical/player_season_stats"
