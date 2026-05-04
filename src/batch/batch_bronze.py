@@ -3,6 +3,7 @@ import logging
 import os
 from pathlib import Path
 from datetime import datetime
+import json
 
 _cwd = Path.cwd()
 LOG_DIR = next((p / "logs" for p in [_cwd, *_cwd.parents] if (p / "logs").is_dir()), _cwd / "logs")
@@ -35,3 +36,35 @@ if response.status_code == 200:
     print(data)
 else:
     logger.error(f"Request failed with status {response.status_code}")
+
+# --- Convert to JSON string ---
+raw_json_str = json.dumps(data)
+
+# --- Ensure table exists (run once; safe to include every time) ---
+spark.sql("""
+    CREATE TABLE IF NOT EXISTS nhl.bronze.nhl_events (
+        event_id BIGINT GENERATED ALWAYS AS IDENTITY,
+        ingestion_timestamp TIMESTAMP,
+        source STRING,
+        raw_json STRING
+    ) USING DELTA
+""")
+logger.info("Table nhl.bronze.nhl_events is ready")
+
+# --- Build a one-row DataFrame ---
+from pyspark.sql import Row
+
+row = Row(
+    ingestion_timestamp=datetime.now(),
+    source=f"play-by-play/{game_id}",        # or simply url
+    raw_json=raw_json_str
+)
+df = spark.createDataFrame([row])
+
+# --- Append to Delta table (event_id auto-generated) ---
+df.write \
+    .format("delta") \
+    .mode("append") \
+    .saveAsTable("nhl.bronze.nhl_events")
+
+logger.info(f"Data for game {game_id} inserted into nhl.bronze.nhl_events")
