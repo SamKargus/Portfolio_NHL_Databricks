@@ -23,7 +23,7 @@ logger = logging.getLogger("batch_bronze")
 logger.info(f"batch_bronze started — log: {log_file}")
 
 BASE_URL = "https://api-web.nhle.com/v1"
-game_id = "2024030416"
+game_id = "1957030216"
 
 url = f"{BASE_URL}/gamecenter/{game_id}/play-by-play"
 logger.info(f"Fetching play-by-play for game_id={game_id} — {url}")
