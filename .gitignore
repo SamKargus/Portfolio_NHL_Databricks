@@ -1,0 +1,17 @@
+# Environment / secrets — never commit real credentials
+config/.env
+*.env
+
+# Logs
+logs/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.pytest_cache/
+
+# macOS
+.DS_Store
