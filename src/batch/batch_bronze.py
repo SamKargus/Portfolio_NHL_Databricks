@@ -2,7 +2,8 @@ import requests
 import logging
 import os
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, date, timedelta
+import time
 import json
 from pyspark.sql import Row
 
@@ -39,9 +40,9 @@ spark.sql("""
 logger.info("Table nhl.bronze.nhl_events is ready")
 
 # ----------------------------------------------------------------------
-# Core function – call this for each game
+# Core function – fetch & store a single game
 # ----------------------------------------------------------------------
-def process_game(game_id: str):
+def process_game(game_id: str) -> bool:
     """
     Fetch play-by-play JSON for a given game_id and append it to the bronze Delta table.
     Returns True if the game was successfully stored, False otherwise.
@@ -78,15 +79,74 @@ def process_game(game_id: str):
     except Exception as e:
         logger.error(f"Exception while processing game {game_id}: {e}")
         return False
-    
 
 # ----------------------------------------------------------------------
-# Example usage
+# Helpers to discover game IDs
+# ----------------------------------------------------------------------
+def get_game_ids_for_day(d: date) -> list:
+    """Return list of game ID strings for a single day."""
+    url = f"{BASE_URL}/schedule/{d.isoformat()}"
+    for attempt in range(1, 6):
+        try:
+            resp = requests.get(url, timeout=15)
+            if resp.status_code == 200:
+                data = resp.json()
+                return [
+                    str(game["id"])
+                    for gw in data.get("gameWeek", [])
+                    for game in gw.get("games", [])
+                ]
+            elif resp.status_code == 429:
+                wait = 2 ** attempt
+                logger.warning(f"429 for {d}, waiting {wait}s (attempt {attempt})")
+                time.sleep(wait)
+            else:
+                return []
+        except Exception as e:
+            logger.warning(f"Error fetching {d}: {e}, waiting before retry")
+            time.sleep(2 ** attempt)
+    return []
+
+def get_all_game_ids(start: date, end: date) -> list:
+    """Collect all game IDs between start and end (inclusive), throttling requests."""
+    ids = []
+    current = start
+    while current <= end:
+        day_ids = get_game_ids_for_day(current)
+        ids.extend(day_ids)
+        logger.info(f"{current} → {len(day_ids)} games")
+        current += timedelta(days=1)
+        time.sleep(0.2)          # keep under ~5 req/s
+    return ids
+
+# ----------------------------------------------------------------------
+# Main execution
 # ----------------------------------------------------------------------
 if __name__ == "__main__":
-    # Process a single game
-    process_game("1917030215")
+    # ----- Set your desired date range -----
+    START_DATE = date(1916, 10, 1)
+    END_DATE   = date.today()
 
-    # Or loop over a list of IDs
-    # for gid in ["2023020001", "2023020002"]:
-    #     process_game(gid)
+    logger.info(f"Collecting game IDs from {START_DATE} to {END_DATE}")
+    all_games = get_all_game_ids(START_DATE, END_DATE)
+    logger.info(f"Total unique game IDs found: {len(all_games)}")
+
+    # ----- Skip games already in the bronze table -----
+    existing_df = spark.sql("SELECT DISTINCT source FROM nhl.bronze.nhl_events")
+    # Assumes source stores the full URL (as used in process_game).
+    # If you stored "play-by-play/{game_id}" instead, adapt the filter accordingly.
+    existing_urls = {r.source for r in existing_df.collect() if r.source}
+    new_games = [gid for gid in all_games
+                 if f"{BASE_URL}/gamecenter/{gid}/play-by-play" not in existing_urls]
+    logger.info(f"Already loaded: {len(existing_urls)} | New to process: {len(new_games)}")
+
+    # ----- Process each new game -----
+    success_count = 0
+    for idx, gid in enumerate(new_games, 1):
+        logger.info(f"Processing {idx}/{len(new_games)}: game {gid}")
+        if process_game(gid):
+            success_count += 1
+        # A small pause between requests to be kind to the API
+        time.sleep(0.2)
+
+    logger.info(f"Done. Successfully stored {success_count}/{len(new_games)} new games.")
