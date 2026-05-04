@@ -56,7 +56,7 @@ from pyspark.sql import Row
 
 row = Row(
     ingestion_timestamp=datetime.now(),
-    source=f"play-by-play/{game_id}",        # or simply url
+    source=f"{url}/{game_id}",        # or simply url
     raw_json=raw_json_str
 )
 df = spark.createDataFrame([row])
