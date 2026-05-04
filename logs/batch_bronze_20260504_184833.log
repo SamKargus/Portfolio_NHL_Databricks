@@ -1,0 +1,3 @@
+2026-05-04 18:48:33,984 [INFO] batch_bronze started — log: /Workspace/Users/samkargus5@gmail.com/Portfolio_NHL_Databricks/logs/batch_bronze_20260504_184833.log
+2026-05-04 18:48:33,987 [INFO] Fetching play-by-play for game_id=2024030416 — https://api-web.nhle.com/v1/gamecenter/2024030416/play-by-play
+2026-05-04 18:48:34,254 [INFO] Request succeeded — 127286 bytes received

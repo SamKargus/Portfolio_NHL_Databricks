@@ -4,7 +4,7 @@ import os
 from pathlib import Path
 from datetime import datetime
 
-_cwd = Path(__file__).resolve().parent
+_cwd = Path.cwd()
 LOG_DIR = next((p / "logs" for p in [_cwd, *_cwd.parents] if (p / "logs").is_dir()), _cwd / "logs")
 LOG_DIR.mkdir(exist_ok=True)
 
