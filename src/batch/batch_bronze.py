@@ -108,15 +108,15 @@ def get_game_ids_for_day(d: date) -> list:
     return []
 
 def get_all_game_ids(start: date, end: date) -> list:
-    """Collect all game IDs between start and end (inclusive), throttling requests."""
+    """Collect all game IDs between start and end (inclusive), stepping weekly."""
     ids = []
     current = start
     while current <= end:
-        day_ids = get_game_ids_for_day(current)
-        ids.extend(day_ids)
-        logger.info(f"{current} → {len(day_ids)} games")
-        current += timedelta(days=1)
-        time.sleep(0.1)          # keep under ~5 req/s
+        week_ids = get_game_ids_for_day(current)
+        ids.extend(week_ids)
+        logger.info(f"Week of {current} → {len(week_ids)} games")
+        current += timedelta(weeks=1)
+        time.sleep(0.1)
     return ids
 
 # ----------------------------------------------------------------------
