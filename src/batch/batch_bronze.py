@@ -124,7 +124,7 @@ def get_all_game_ids(start: date, end: date) -> list:
 # ----------------------------------------------------------------------
 if __name__ == "__main__":
     # ----- Set your desired date range -----
-    START_DATE = date(1916, 12, 1)
+    START_DATE = date(1916, 8, 1)
     END_DATE   = date.today()
 
     logger.info(f"Collecting game IDs from {START_DATE} to {END_DATE}")
