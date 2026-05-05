@@ -128,7 +128,7 @@ if __name__ == "__main__":
     END_DATE   = date.today()
 
     logger.info(f"Collecting game IDs from {START_DATE} to {END_DATE}")
-    all_games = get_all_game_ids(START_DATE, END_DATE)
+    all_games = list(dict.fromkeys(get_all_game_ids(START_DATE, END_DATE)))
     logger.info(f"Total unique game IDs found: {len(all_games)}")
 
     # ----- Skip games already in the bronze table -----
