@@ -116,7 +116,7 @@ def get_all_game_ids(start: date, end: date) -> list:
         ids.extend(week_ids)
         logger.info(f"Week of {current} → {len(week_ids)} games")
         current += timedelta(weeks=1)
-        time.sleep(0.1)
+        time.sleep(0.2)
     return ids
 
 # ----------------------------------------------------------------------
@@ -146,6 +146,6 @@ if __name__ == "__main__":
         if process_game(gid):
             success_count += 1
         # A small pause between requests to be kind to the API
-        time.sleep(0.1)
+        time.sleep(0.2)
 
     logger.info(f"Done. Successfully stored {success_count}/{len(new_games)} new games.")
