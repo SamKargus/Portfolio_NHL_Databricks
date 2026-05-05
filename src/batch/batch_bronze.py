@@ -28,7 +28,7 @@ logger.info(f"batch_bronze started — log: {log_file}")
 
 BASE_URL = "https://api-web.nhle.com/v1"
 
-# Ensure the target Delta table exists (idempotent)
+# Ensure the target Delta table exists
 spark.sql("""
     CREATE TABLE IF NOT EXISTS nhl.bronze.nhl_events (
         event_id BIGINT GENERATED ALWAYS AS IDENTITY,
@@ -63,7 +63,7 @@ def process_game(game_id: str) -> bool:
 
         row = Row(
             ingestion_timestamp=datetime.now(),
-            source=url,          # or use f"play-by-play/{game_id}"
+            source=url,
             raw_json=raw_json_str
         )
         df = spark.createDataFrame([row])
@@ -116,7 +116,7 @@ def get_all_game_ids(start: date, end: date) -> list:
         ids.extend(day_ids)
         logger.info(f"{current} → {len(day_ids)} games")
         current += timedelta(days=1)
-        time.sleep(0.2)          # keep under ~5 req/s
+        time.sleep(0.1)          # keep under ~5 req/s
     return ids
 
 # ----------------------------------------------------------------------
@@ -124,7 +124,7 @@ def get_all_game_ids(start: date, end: date) -> list:
 # ----------------------------------------------------------------------
 if __name__ == "__main__":
     # ----- Set your desired date range -----
-    START_DATE = date(1916, 10, 1)
+    START_DATE = date(1916, 12, 1)
     END_DATE   = date.today()
 
     logger.info(f"Collecting game IDs from {START_DATE} to {END_DATE}")
@@ -134,7 +134,6 @@ if __name__ == "__main__":
     # ----- Skip games already in the bronze table -----
     existing_df = spark.sql("SELECT DISTINCT source FROM nhl.bronze.nhl_events")
     # Assumes source stores the full URL (as used in process_game).
-    # If you stored "play-by-play/{game_id}" instead, adapt the filter accordingly.
     existing_urls = {r.source for r in existing_df.collect() if r.source}
     new_games = [gid for gid in all_games
                  if f"{BASE_URL}/gamecenter/{gid}/play-by-play" not in existing_urls]
@@ -147,6 +146,6 @@ if __name__ == "__main__":
         if process_game(gid):
             success_count += 1
         # A small pause between requests to be kind to the API
-        time.sleep(0.2)
+        time.sleep(0.1)
 
     logger.info(f"Done. Successfully stored {success_count}/{len(new_games)} new games.")
