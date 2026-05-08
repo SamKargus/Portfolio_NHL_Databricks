@@ -47,9 +47,9 @@ KNOWN_GAME_FIELDS = REQUIRED_GAME_FIELDS | {
     "summary",
 }
 
-REQUIRED_TEAM_FIELDS = {"id", "abbrev", "score", "sog", "commonName"}
+REQUIRED_TEAM_FIELDS = {"id", "abbrev", "score", "commonName"}
 KNOWN_TEAM_FIELDS = REQUIRED_TEAM_FIELDS | {
-    "logo", "darkLogo", "placeName", "placeNameWithPreposition",
+    "sog", "logo", "darkLogo", "placeName", "placeNameWithPreposition",
 }
 
 REQUIRED_PLAY_FIELDS = {"eventId", "typeCode", "typeDescKey", "sortOrder"}
