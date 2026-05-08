@@ -64,6 +64,7 @@ KNOWN_DETAIL_FIELDS = {
     "scoringPlayerId", "scoringPlayerTotal",
     "assist1PlayerId", "assist1PlayerTotal",
     "assist2PlayerId", "assist2PlayerTotal",
+    "assist3PlayerId", "assist3PlayerTotal",
     "awayScore", "homeScore", "awaySOG", "homeSOG",
     "hittingPlayerId", "hitteePlayerId",
     "blockingPlayerId",
@@ -160,6 +161,8 @@ SILVER_SCHEMA = StructType([
     StructField("assist1_player_total",     IntegerType()),
     StructField("assist2_player_id",        IntegerType()),
     StructField("assist2_player_total",     IntegerType()),
+    StructField("assist3_player_id",        IntegerType()),
+    StructField("assist3_player_total",     IntegerType()),
     StructField("away_score",               IntegerType()),
     StructField("home_score",               IntegerType()),
     StructField("away_sog",                 IntegerType()),
@@ -233,6 +236,8 @@ spark.sql("""
         assist1_player_total    INT,
         assist2_player_id       INT,
         assist2_player_total    INT,
+        assist3_player_id       INT,
+        assist3_player_total    INT,
         away_score              INT,
         home_score              INT,
         away_sog                INT,
@@ -257,8 +262,10 @@ spark.sql("""
 
 # Add columns introduced after the table was first created (safe to re-run)
 for col_ddl in [
-    "special_event  STRING",
-    "situation_code STRING",
+    "special_event        STRING",
+    "situation_code       STRING",
+    "assist3_player_id    INT",
+    "assist3_player_total INT",
 ]:
     try:
         spark.sql(f"ALTER TABLE nhl.silver.nhl_plays ADD COLUMN {col_ddl}")
@@ -412,6 +419,8 @@ def parse_plays(data: dict, ingestion_ts: datetime) -> list:
             "assist1_player_total":     _int(d.get("assist1PlayerTotal")),
             "assist2_player_id":        _int(d.get("assist2PlayerId")),
             "assist2_player_total":     _int(d.get("assist2PlayerTotal")),
+            "assist3_player_id":        _int(d.get("assist3PlayerId")),
+            "assist3_player_total":     _int(d.get("assist3PlayerTotal")),
             "away_score":               _int(d.get("awayScore")),
             "home_score":               _int(d.get("homeScore")),
             "away_sog":                 _int(d.get("awaySOG")),
