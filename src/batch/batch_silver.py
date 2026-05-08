@@ -44,7 +44,7 @@ KNOWN_GAME_FIELDS = REQUIRED_GAME_FIELDS | {
     "gameScheduleState", "regPeriods", "venue", "venueLocation",
     "gameOutcome", "periodDescriptor", "tvBroadcasts", "shootoutInUse",
     "otInUse", "clock", "displayPeriod", "maxPeriods", "rosterSpots",
-    "summary",
+    "summary", "specialEvent",
 }
 
 REQUIRED_TEAM_FIELDS = {"id", "abbrev", "score", "commonName"}
@@ -55,6 +55,7 @@ KNOWN_TEAM_FIELDS = REQUIRED_TEAM_FIELDS | {
 REQUIRED_PLAY_FIELDS = {"eventId", "typeCode", "typeDescKey", "sortOrder"}
 KNOWN_PLAY_FIELDS = REQUIRED_PLAY_FIELDS | {
     "periodDescriptor", "timeInPeriod", "timeRemaining", "details",
+    "situationCode",
 }
 
 KNOWN_DETAIL_FIELDS = {
@@ -137,6 +138,7 @@ SILVER_SCHEMA = StructType([
     StructField("home_final_sog",           IntegerType()),
     StructField("last_period_type",         StringType()),
     StructField("reg_periods",              IntegerType()),
+    StructField("special_event",            StringType()),
     # Play fields
     StructField("event_id",                 IntegerType()),
     StructField("period_number",            IntegerType()),
@@ -175,6 +177,7 @@ SILVER_SCHEMA = StructType([
     StructField("drawn_by_player_id",       IntegerType()),
     StructField("served_by_player_id",      IntegerType()),
     StructField("stoppage_reason",          StringType()),
+    StructField("situation_code",           StringType()),
     StructField("ingestion_timestamp",      TimestampType()),
 ])
 
@@ -209,6 +212,7 @@ spark.sql("""
         home_final_sog          INT,
         last_period_type        STRING,
         reg_periods             INT,
+        special_event           STRING,
         event_id                INT,
         period_number           INT,
         period_type             STRING,
@@ -246,9 +250,20 @@ spark.sql("""
         drawn_by_player_id      INT,
         served_by_player_id     INT,
         stoppage_reason         STRING,
+        situation_code          STRING,
         ingestion_timestamp     TIMESTAMP
     ) USING DELTA
 """)
+
+# Add columns introduced after the table was first created (safe to re-run)
+for col_ddl in [
+    "special_event  STRING",
+    "situation_code STRING",
+]:
+    try:
+        spark.sql(f"ALTER TABLE nhl.silver.nhl_plays ADD COLUMN {col_ddl}")
+    except Exception:
+        pass  # column already exists
 
 logger.info("Table nhl.silver.nhl_plays is ready")
 
@@ -365,6 +380,9 @@ def parse_plays(data: dict, ingestion_ts: datetime) -> list:
         "home_final_sog":       _int(home.get("sog")),
         "last_period_type":     _str(outcome.get("lastPeriodType")),
         "reg_periods":          _int(data.get("regPeriods")),
+        "special_event":        _str((data.get("specialEvent") or {}).get("default")
+                                     if isinstance(data.get("specialEvent"), dict)
+                                     else data.get("specialEvent")),
         "ingestion_timestamp":  ingestion_ts,
     }
 
@@ -411,6 +429,7 @@ def parse_plays(data: dict, ingestion_ts: datetime) -> list:
             "drawn_by_player_id":       _int(d.get("drawnByPlayerId")),
             "served_by_player_id":      _int(d.get("servedByPlayerId")),
             "stoppage_reason":          _str(d.get("reason")),
+            "situation_code":           _str(play.get("situationCode")),
         }
         rows.append(row)
     return rows
