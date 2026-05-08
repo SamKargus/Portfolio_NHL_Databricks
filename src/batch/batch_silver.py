@@ -30,6 +30,53 @@ logger.info(f"batch_silver started — log: {log_file}")
 CHUNK_SIZE = 500  # flush to Delta every N games
 
 # ----------------------------------------------------------------------
+# Field contracts
+# Fields we explicitly map to silver columns — any that disappear from
+# the API will halt the pipeline; any new ones we don't know about will
+# trigger a warning.
+# ----------------------------------------------------------------------
+REQUIRED_GAME_FIELDS = {
+    "id", "season", "gameType", "gameDate", "gameState",
+    "awayTeam", "homeTeam", "plays",
+}
+KNOWN_GAME_FIELDS = REQUIRED_GAME_FIELDS | {
+    "limitedScoring", "startTimeUTC", "easternUTCOffset", "venueUTCOffset",
+    "gameScheduleState", "regPeriods", "venue", "venueLocation",
+    "gameOutcome", "periodDescriptor", "tvBroadcasts", "shootoutInUse",
+    "otInUse", "clock", "displayPeriod", "maxPeriods", "rosterSpots",
+    "summary",
+}
+
+REQUIRED_TEAM_FIELDS = {"id", "abbrev", "score", "sog", "commonName"}
+KNOWN_TEAM_FIELDS = REQUIRED_TEAM_FIELDS | {
+    "logo", "darkLogo", "placeName", "placeNameWithPreposition",
+}
+
+REQUIRED_PLAY_FIELDS = {"eventId", "typeCode", "typeDescKey", "sortOrder"}
+KNOWN_PLAY_FIELDS = REQUIRED_PLAY_FIELDS | {
+    "periodDescriptor", "timeInPeriod", "timeRemaining", "details",
+}
+
+KNOWN_DETAIL_FIELDS = {
+    "xCoord", "yCoord", "eventOwnerTeamId", "shotType",
+    "shootingPlayerId", "goalieInNetId",
+    "scoringPlayerId", "scoringPlayerTotal",
+    "assist1PlayerId", "assist1PlayerTotal",
+    "assist2PlayerId", "assist2PlayerTotal",
+    "awayScore", "homeScore", "awaySOG", "homeSOG",
+    "hittingPlayerId", "hitteePlayerId",
+    "blockingPlayerId",
+    "winningPlayerId", "losingPlayerId",
+    "playerId",
+    "typeCode", "descKey", "duration",
+    "committedByPlayerId", "drawnByPlayerId", "servedByPlayerId",
+    "reason",
+}
+
+# Dedup set — each warning string fires at most once per run
+_seen_warnings: set = set()
+
+# ----------------------------------------------------------------------
 # Type helpers
 # ----------------------------------------------------------------------
 def _int(v):
@@ -206,6 +253,86 @@ spark.sql("""
 logger.info("Table nhl.silver.nhl_plays is ready")
 
 # ----------------------------------------------------------------------
+# Schema validation
+# ----------------------------------------------------------------------
+def validate_game(game_id: int, data: dict) -> None:
+    """
+    Warns on new unmapped fields (data not yet captured in silver).
+    Raises ValueError — halting the pipeline — if a required mapped
+    field has been removed or renamed in the source API.
+    """
+    errors = []
+
+    # --- Game level ---
+    for f in sorted(REQUIRED_GAME_FIELDS - data.keys()):
+        errors.append(f"required game field '{f}' is missing")
+
+    for f in sorted(data.keys() - KNOWN_GAME_FIELDS):
+        key = f"game:{f}"
+        if key not in _seen_warnings:
+            logger.warning(
+                f"NEW UNMAPPED FIELD — game level: '{f}' "
+                f"(game_id={game_id}). Add to KNOWN_GAME_FIELDS and silver schema to capture it."
+            )
+            _seen_warnings.add(key)
+
+    # --- Team level ---
+    for team_key in ("awayTeam", "homeTeam"):
+        team = data.get(team_key) or {}
+        for f in sorted(REQUIRED_TEAM_FIELDS - team.keys()):
+            errors.append(f"required field '{f}' missing in {team_key}")
+        for f in sorted(team.keys() - KNOWN_TEAM_FIELDS):
+            key = f"{team_key}:{f}"
+            if key not in _seen_warnings:
+                logger.warning(
+                    f"NEW UNMAPPED FIELD — {team_key}: '{f}' "
+                    f"(game_id={game_id}). Add to KNOWN_TEAM_FIELDS and silver schema to capture it."
+                )
+                _seen_warnings.add(key)
+
+    # --- Play level (deduplicated across all plays in this game) ---
+    unknown_play_fields: set = set()
+    unknown_detail_fields: set = set()
+
+    for play in data.get("plays") or []:
+        for f in sorted(REQUIRED_PLAY_FIELDS - play.keys()):
+            errors.append(
+                f"required play field '{f}' missing "
+                f"(eventId={play.get('eventId', '?')})"
+            )
+        unknown_play_fields   |= play.keys() - KNOWN_PLAY_FIELDS
+        unknown_detail_fields |= (play.get("details") or {}).keys() - KNOWN_DETAIL_FIELDS
+
+    for f in sorted(unknown_play_fields):
+        key = f"play:{f}"
+        if key not in _seen_warnings:
+            logger.warning(
+                f"NEW UNMAPPED FIELD — play level: '{f}' "
+                f"(game_id={game_id}). Add to KNOWN_PLAY_FIELDS and silver schema to capture it."
+            )
+            _seen_warnings.add(key)
+
+    for f in sorted(unknown_detail_fields):
+        key = f"detail:{f}"
+        if key not in _seen_warnings:
+            logger.warning(
+                f"NEW UNMAPPED FIELD — play details: '{f}' "
+                f"(game_id={game_id}). Add to KNOWN_DETAIL_FIELDS and silver schema to capture it."
+            )
+            _seen_warnings.add(key)
+
+    # --- Stop pipeline on any missing required field ---
+    if errors:
+        msg = (
+            f"PIPELINE STOPPED — game_id={game_id} is missing required mapped fields: "
+            + ", ".join(errors)
+            + ". A previously mapped API field may have been renamed or removed."
+        )
+        logger.error(msg)
+        raise ValueError(msg)
+
+
+# ----------------------------------------------------------------------
 # Parse helper — one dict per play with game context embedded
 # ----------------------------------------------------------------------
 def parse_plays(data: dict, ingestion_ts: datetime) -> list:
@@ -317,6 +444,8 @@ if __name__ == "__main__":
                 skipped += 1
                 continue
 
+            validate_game(game_id, data)  # warns on new fields; raises on missing required fields
+
             buf.extend(parse_plays(data, row.ingestion_timestamp))
             existing_game_ids.add(game_id)
             processed += 1
@@ -327,6 +456,8 @@ if __name__ == "__main__":
                     .write.format("delta").mode("append").saveAsTable("nhl.silver.nhl_plays")
                 buf = []
 
+        except ValueError:
+            raise  # missing required field — halt immediately
         except Exception as e:
             logger.error(f"Failed on bronze row (event_id={row.event_id}): {e}")
             errors += 1
