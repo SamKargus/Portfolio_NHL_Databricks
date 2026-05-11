@@ -29,8 +29,8 @@ logger = logging.getLogger("batch_silver")
 logger.info(f"batch_silver started — log: {log_file}")
 
 CHUNK_SIZE = 500  # flush to Delta every N games
-MAX_FLUSH_RETRIES = 3
-FLUSH_RETRY_DELAY = 30  # seconds between retries on transient Spark Connect errors
+MAX_FLUSH_RETRIES = 5
+FLUSH_RETRY_BASE_DELAY = 30  # seconds; doubles each attempt (30, 60, 120, 240, ...)
 
 
 def _flush(buf: list, table: str, schema) -> None:
@@ -42,11 +42,12 @@ def _flush(buf: list, table: str, schema) -> None:
         except Exception as e:
             if attempt == MAX_FLUSH_RETRIES:
                 raise
+            delay = FLUSH_RETRY_BASE_DELAY * (2 ** (attempt - 1))
             logger.warning(
                 f"Flush attempt {attempt}/{MAX_FLUSH_RETRIES} failed "
-                f"({type(e).__name__}), retrying in {FLUSH_RETRY_DELAY}s..."
+                f"({type(e).__name__}), retrying in {delay}s..."
             )
-            time.sleep(FLUSH_RETRY_DELAY)
+            time.sleep(delay)
 
 # ----------------------------------------------------------------------
 # Field contracts
