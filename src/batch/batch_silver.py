@@ -1,5 +1,6 @@
 import json
 import logging
+import time
 from pathlib import Path
 from datetime import datetime
 from pyspark.sql.types import (
@@ -28,6 +29,24 @@ logger = logging.getLogger("batch_silver")
 logger.info(f"batch_silver started — log: {log_file}")
 
 CHUNK_SIZE = 500  # flush to Delta every N games
+MAX_FLUSH_RETRIES = 3
+FLUSH_RETRY_DELAY = 30  # seconds between retries on transient Spark Connect errors
+
+
+def _flush(buf: list, table: str, schema) -> None:
+    for attempt in range(1, MAX_FLUSH_RETRIES + 1):
+        try:
+            spark.createDataFrame(buf, schema=schema) \
+                .write.format("delta").mode("append").saveAsTable(table)
+            return
+        except Exception as e:
+            if attempt == MAX_FLUSH_RETRIES:
+                raise
+            logger.warning(
+                f"Flush attempt {attempt}/{MAX_FLUSH_RETRIES} failed "
+                f"({type(e).__name__}), retrying in {FLUSH_RETRY_DELAY}s..."
+            )
+            time.sleep(FLUSH_RETRY_DELAY)
 
 # ----------------------------------------------------------------------
 # Field contracts
@@ -480,8 +499,7 @@ if __name__ == "__main__":
 
             if processed % CHUNK_SIZE == 0:
                 logger.info(f"Flushing chunk — {processed} games, {len(buf)} play rows...")
-                spark.createDataFrame(buf, schema=SILVER_SCHEMA) \
-                    .write.format("delta").mode("append").saveAsTable("nhl.silver.nhl_plays")
+                _flush(buf, "nhl.silver.nhl_plays", SILVER_SCHEMA)
                 buf = []
 
         except ValueError:
@@ -492,7 +510,6 @@ if __name__ == "__main__":
 
     if buf:
         logger.info(f"Flushing final chunk — {len(buf)} play rows...")
-        spark.createDataFrame(buf, schema=SILVER_SCHEMA) \
-            .write.format("delta").mode("append").saveAsTable("nhl.silver.nhl_plays")
+        _flush(buf, "nhl.silver.nhl_plays", SILVER_SCHEMA)
 
     logger.info(f"Done. Processed={processed} | Skipped={skipped} | Errors={errors}")
