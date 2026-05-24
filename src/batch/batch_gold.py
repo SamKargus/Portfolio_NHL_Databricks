@@ -413,9 +413,7 @@ spark.sql("CREATE SCHEMA IF NOT EXISTS nhl.gold")
 logger.info("Gold schema ready.")
 
 logger.info(f"Reading silver table: {SILVER_TABLE}")
-silver = spark.table(SILVER_TABLE).cache()
-row_count = silver.count()
-logger.info(f"Silver table loaded — {row_count:,} play rows.")
+silver = spark.table(SILVER_TABLE)
 
 logger.info("Building player stats…")
 player_stats = build_player_stats(silver)
@@ -443,5 +441,4 @@ logger.info(f"Writing {TEAM_STATS_TABLE}…")
 ts_count = spark.table(TEAM_STATS_TABLE).count()
 logger.info(f"Team stats written — {ts_count:,} team-season rows.")
 
-silver.unpersist()
 logger.info("batch_gold complete.")
