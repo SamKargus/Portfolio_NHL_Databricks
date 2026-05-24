@@ -54,10 +54,10 @@ _SC_HOME_SK = F.col("situation_code").substr(3, 1).cast("int")
 # ----------------------------------------------------------------------
 def build_player_stats(silver):
     """
-    Returns a DataFrame with one row per (season, game_type, player_id).
+    Returns a DataFrame with one row per (season, game_type, player_name).
 
     Columns:
-      season, game_type, player_id,
+      season, game_type, player_name,
       games_played, goals, primary_assists, secondary_assists, assists, points,
       shots_on_goal, shooting_pct,
       hits, blocked_shots,
@@ -65,146 +65,144 @@ def build_player_stats(silver):
       penalty_minutes, giveaways, takeaways,
       ingestion_timestamp
     """
-    GC = ["season", "game_type"]  # group-by columns shared across all aggregations
+    GC = ["season", "game_type"]
 
     # ---- games_played ------------------------------------------------
-    # Union every column that carries a player ID; a player "played" in any
-    # game where their ID appears in any event role.
-    player_id_cols = [
-        "scoring_player_id",
-        "assist1_player_id", "assist2_player_id", "assist3_player_id",
-        "shooting_player_id", "goalie_in_net_id",
-        "hitting_player_id", "hittee_player_id",
-        "blocking_player_id",
-        "winning_player_id", "losing_player_id",
-        "committed_by_player_id", "drawn_by_player_id", "served_by_player_id",
-        "player_id",
+    player_name_cols = [
+        "scoring_player_name",
+        "assist1_player_name", "assist2_player_name", "assist3_player_name",
+        "shooting_player_name", "goalie_in_net_name",
+        "hitting_player_name", "hittee_player_name",
+        "blocking_player_name",
+        "winning_player_name", "losing_player_name",
+        "committed_by_player_name", "drawn_by_player_name", "served_by_player_name",
+        "player_name",
     ]
     appearances = None
-    for col_name in player_id_cols:
+    for col_name in player_name_cols:
         subset = (
             silver.filter(F.col(col_name).isNotNull())
-            .select(*GC, "game_id", F.col(col_name).alias("pid"))
+            .select(*GC, "game_id", F.col(col_name).alias("pname"))
         )
         appearances = subset if appearances is None else appearances.union(subset)
 
     games_played = (
         appearances.distinct()
-        .groupBy(*GC, "pid")
+        .groupBy(*GC, "pname")
         .agg(F.countDistinct("game_id").alias("games_played"))
-        .withColumnRenamed("pid", "player_id")
+        .withColumnRenamed("pname", "player_name")
     )
 
     # ---- goals -------------------------------------------------------
     goals = (
         silver.filter(F.col("type_desc_key") == "goal")
-        .filter(F.col("scoring_player_id").isNotNull())
-        .groupBy(*GC, F.col("scoring_player_id").alias("player_id"))
+        .filter(F.col("scoring_player_name").isNotNull())
+        .groupBy(*GC, F.col("scoring_player_name").alias("player_name"))
         .agg(F.count("*").alias("goals"))
     )
 
     # ---- primary assists ---------------------------------------------
     primary_assists = (
         silver.filter(F.col("type_desc_key") == "goal")
-        .filter(F.col("assist1_player_id").isNotNull())
-        .groupBy(*GC, F.col("assist1_player_id").alias("player_id"))
+        .filter(F.col("assist1_player_name").isNotNull())
+        .groupBy(*GC, F.col("assist1_player_name").alias("player_name"))
         .agg(F.count("*").alias("primary_assists"))
     )
 
     # ---- secondary assists (assist2 + assist3 combined) --------------
     secondary_assists = (
         silver.filter(F.col("type_desc_key") == "goal")
-        .select(*GC, "assist2_player_id", "assist3_player_id")
+        .select(*GC, "assist2_player_name", "assist3_player_name")
         .select(
             *GC,
             F.explode(
-                F.array(F.col("assist2_player_id"), F.col("assist3_player_id"))
-            ).alias("player_id"),
+                F.array(F.col("assist2_player_name"), F.col("assist3_player_name"))
+            ).alias("player_name"),
         )
-        .filter(F.col("player_id").isNotNull())
-        .groupBy(*GC, "player_id")
+        .filter(F.col("player_name").isNotNull())
+        .groupBy(*GC, "player_name")
         .agg(F.count("*").alias("secondary_assists"))
     )
 
     # ---- shots on goal (goals count as shots) -----------------------
     shots_on_goal = (
         silver.filter(F.col("type_desc_key").isin("shot-on-goal", "goal"))
-        .filter(F.col("shooting_player_id").isNotNull())
-        .groupBy(*GC, F.col("shooting_player_id").alias("player_id"))
+        .filter(F.col("shooting_player_name").isNotNull())
+        .groupBy(*GC, F.col("shooting_player_name").alias("player_name"))
         .agg(F.count("*").alias("shots_on_goal"))
     )
 
     # ---- hits (the hitter, not the recipient) -----------------------
     hits = (
         silver.filter(F.col("type_desc_key") == "hit")
-        .filter(F.col("hitting_player_id").isNotNull())
-        .groupBy(*GC, F.col("hitting_player_id").alias("player_id"))
+        .filter(F.col("hitting_player_name").isNotNull())
+        .groupBy(*GC, F.col("hitting_player_name").alias("player_name"))
         .agg(F.count("*").alias("hits"))
     )
 
     # ---- blocked shots (the defender who blocked) ------------------
     blocked_shots = (
         silver.filter(F.col("type_desc_key") == "blocked-shot")
-        .filter(F.col("blocking_player_id").isNotNull())
-        .groupBy(*GC, F.col("blocking_player_id").alias("player_id"))
+        .filter(F.col("blocking_player_name").isNotNull())
+        .groupBy(*GC, F.col("blocking_player_name").alias("player_name"))
         .agg(F.count("*").alias("blocked_shots"))
     )
 
     # ---- faceoffs ---------------------------------------------------
     faceoff_wins = (
         silver.filter(F.col("type_desc_key") == "faceoff")
-        .filter(F.col("winning_player_id").isNotNull())
-        .groupBy(*GC, F.col("winning_player_id").alias("player_id"))
+        .filter(F.col("winning_player_name").isNotNull())
+        .groupBy(*GC, F.col("winning_player_name").alias("player_name"))
         .agg(F.count("*").alias("faceoff_wins"))
     )
 
     faceoff_losses = (
         silver.filter(F.col("type_desc_key") == "faceoff")
-        .filter(F.col("losing_player_id").isNotNull())
-        .groupBy(*GC, F.col("losing_player_id").alias("player_id"))
+        .filter(F.col("losing_player_name").isNotNull())
+        .groupBy(*GC, F.col("losing_player_name").alias("player_name"))
         .agg(F.count("*").alias("faceoff_losses"))
     )
 
     # ---- penalty minutes -------------------------------------------
     pim = (
         silver.filter(F.col("type_desc_key") == "penalty")
-        .filter(F.col("committed_by_player_id").isNotNull())
+        .filter(F.col("committed_by_player_name").isNotNull())
         .filter(F.col("penalty_duration").isNotNull())
-        .groupBy(*GC, F.col("committed_by_player_id").alias("player_id"))
+        .groupBy(*GC, F.col("committed_by_player_name").alias("player_name"))
         .agg(F.sum("penalty_duration").alias("penalty_minutes"))
     )
 
     # ---- giveaways & takeaways -------------------------------------
     giveaways = (
         silver.filter(F.col("type_desc_key") == "giveaway")
-        .filter(F.col("player_id").isNotNull())
-        .groupBy(*GC, "player_id")
+        .filter(F.col("player_name").isNotNull())
+        .groupBy(*GC, "player_name")
         .agg(F.count("*").alias("giveaways"))
     )
 
     takeaways = (
         silver.filter(F.col("type_desc_key") == "takeaway")
-        .filter(F.col("player_id").isNotNull())
-        .groupBy(*GC, "player_id")
+        .filter(F.col("player_name").isNotNull())
+        .groupBy(*GC, "player_name")
         .agg(F.count("*").alias("takeaways"))
     )
 
     # ---- join & derive computed columns ----------------------------
-    z = F.lit(0).cast("bigint")  # default zero for nullable counts
+    z = F.lit(0).cast("bigint")
 
     return (
         games_played
-        .join(goals,            [*GC, "player_id"], "left")
-        .join(primary_assists,  [*GC, "player_id"], "left")
-        .join(secondary_assists,[*GC, "player_id"], "left")
-        .join(shots_on_goal,    [*GC, "player_id"], "left")
-        .join(hits,             [*GC, "player_id"], "left")
-        .join(blocked_shots,    [*GC, "player_id"], "left")
-        .join(faceoff_wins,     [*GC, "player_id"], "left")
-        .join(faceoff_losses,   [*GC, "player_id"], "left")
-        .join(pim,              [*GC, "player_id"], "left")
-        .join(giveaways,        [*GC, "player_id"], "left")
-        .join(takeaways,        [*GC, "player_id"], "left")
+        .join(goals,             [*GC, "player_name"], "left")
+        .join(primary_assists,   [*GC, "player_name"], "left")
+        .join(secondary_assists, [*GC, "player_name"], "left")
+        .join(shots_on_goal,     [*GC, "player_name"], "left")
+        .join(hits,              [*GC, "player_name"], "left")
+        .join(blocked_shots,     [*GC, "player_name"], "left")
+        .join(faceoff_wins,      [*GC, "player_name"], "left")
+        .join(faceoff_losses,    [*GC, "player_name"], "left")
+        .join(pim,               [*GC, "player_name"], "left")
+        .join(giveaways,         [*GC, "player_name"], "left")
+        .join(takeaways,         [*GC, "player_name"], "left")
         .withColumn("goals",             F.coalesce("goals", z))
         .withColumn("primary_assists",   F.coalesce("primary_assists", z))
         .withColumn("secondary_assists", F.coalesce("secondary_assists", z))
@@ -239,7 +237,7 @@ def build_player_stats(silver):
         .withColumn("takeaways",         F.coalesce("takeaways", z))
         .withColumn("ingestion_timestamp", F.current_timestamp())
         .select(
-            "season", "game_type", "player_id",
+            "season", "game_type", "player_name",
             "games_played",
             "goals", "primary_assists", "secondary_assists", "assists", "points",
             "shots_on_goal", "shooting_pct",
@@ -415,48 +413,33 @@ def build_team_stats(silver):
 # ----------------------------------------------------------------------
 def build_dim_players(silver):
     """
-    Returns a DataFrame with one row per player_id sourced from the name
-    columns embedded in nhl.silver.nhl_plays.
+    Returns a DataFrame with one row per player_name.
 
-    Unions every (player_id, player_name) pair across all player role
-    columns, then deduplicates to the single most-seen name per player.
+    player_id is a stable integer derived from hashing the player_name —
+    consistent across runs and used as the surrogate key for joins.
 
     Columns: player_id, player_name, ingestion_timestamp
     """
-    id_name_pairs = [
-        ("scoring_player_id",      "scoring_player_name"),
-        ("assist1_player_id",      "assist1_player_name"),
-        ("assist2_player_id",      "assist2_player_name"),
-        ("assist3_player_id",      "assist3_player_name"),
-        ("shooting_player_id",     "shooting_player_name"),
-        ("goalie_in_net_id",       "goalie_in_net_name"),
-        ("hitting_player_id",      "hitting_player_name"),
-        ("hittee_player_id",       "hittee_player_name"),
-        ("blocking_player_id",     "blocking_player_name"),
-        ("winning_player_id",      "winning_player_name"),
-        ("losing_player_id",       "losing_player_name"),
-        ("committed_by_player_id", "committed_by_player_name"),
-        ("drawn_by_player_id",     "drawn_by_player_name"),
-        ("served_by_player_id",    "served_by_player_name"),
-        ("player_id",              "player_name"),
+    player_name_cols = [
+        "scoring_player_name",
+        "assist1_player_name", "assist2_player_name", "assist3_player_name",
+        "shooting_player_name", "goalie_in_net_name",
+        "hitting_player_name", "hittee_player_name",
+        "blocking_player_name",
+        "winning_player_name", "losing_player_name",
+        "committed_by_player_name", "drawn_by_player_name", "served_by_player_name",
+        "player_name",
     ]
 
-    pairs = None
-    for id_col, name_col in id_name_pairs:
-        subset = (
-            silver
-            .filter(F.col(id_col).isNotNull())
-            .filter(F.col(name_col).isNotNull())
-            .select(
-                F.col(id_col).alias("player_id"),
-                F.col(name_col).alias("player_name"),
-            )
-        )
-        pairs = subset if pairs is None else pairs.union(subset)
+    all_names = None
+    for col_name in player_name_cols:
+        subset = silver.filter(F.col(col_name).isNotNull()).select(F.col(col_name).alias("player_name"))
+        all_names = subset if all_names is None else all_names.union(subset)
 
     return (
-        pairs
-        .dropDuplicates(["player_id"])
+        all_names
+        .dropDuplicates(["player_name"])
+        .withColumn("player_id", F.abs(F.hash("player_name")))
         .withColumn("ingestion_timestamp", F.current_timestamp())
         .select("player_id", "player_name", "ingestion_timestamp")
     )
