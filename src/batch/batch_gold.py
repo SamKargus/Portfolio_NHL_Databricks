@@ -414,8 +414,6 @@ logger.info("Gold schema ready.")
 
 logger.info(f"Reading silver table: {SILVER_TABLE}")
 silver = spark.table(SILVER_TABLE)
-row_count = silver.count()
-logger.info(f"Silver table loaded — {row_count:,} play rows.")
 
 logger.info("Building player stats…")
 player_stats = build_player_stats(silver)
