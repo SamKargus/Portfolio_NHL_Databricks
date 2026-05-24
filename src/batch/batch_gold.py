@@ -1,20 +1,23 @@
 """
-Gold layer — aggregated player and team statistics derived from nhl.silver.nhl_plays.
+Gold layer — aggregated player and team statistics derived from the silver tables.
 
-Produces two tables:
+Produces three tables:
   nhl.gold.player_stats  — per-player, per-season, per-game-type aggregates
                            (goals, assists, points, shots, hits, faceoffs, PIM, …)
   nhl.gold.team_stats    — per-team, per-season, per-game-type aggregates
                            (wins, losses, goals, shots, PP goals, SH goals, PIM, …)
+  nhl.gold.dim_players   — one row per player (most recent known name, position,
+                           team, sweater number, headshot URL) sourced from
+                           nhl.silver.nhl_players; join to player_stats on player_id
 
-Both tables are fully overwritten on each run so they always reflect the current
+All tables are fully overwritten on each run so they always reflect current
 silver data.  The script is idempotent and safe to re-run at any time.
 """
 
 import logging
 from pathlib import Path
 from datetime import datetime
-from pyspark.sql import functions as F
+from pyspark.sql import functions as F, Window
 
 # ----------------------------------------------------------------------
 # Setup (run once)
@@ -35,9 +38,11 @@ logging.basicConfig(
 logger = logging.getLogger("batch_gold")
 logger.info(f"batch_gold started — log: {log_file}")
 
-SILVER_TABLE       = "nhl.silver.nhl_plays"
-PLAYER_STATS_TABLE = "nhl.gold.player_stats"
-TEAM_STATS_TABLE   = "nhl.gold.team_stats"
+SILVER_TABLE         = "nhl.silver.nhl_plays"
+SILVER_PLAYERS_TABLE = "nhl.silver.nhl_players"
+PLAYER_STATS_TABLE   = "nhl.gold.player_stats"
+TEAM_STATS_TABLE     = "nhl.gold.team_stats"
+DIM_PLAYERS_TABLE    = "nhl.gold.dim_players"
 
 # situation_code layout: [away_goalie][away_skaters][home_skaters][home_goalie]
 # e.g. "1551" = even strength 5v5 with both goalies on ice
@@ -407,38 +412,71 @@ def build_team_stats(silver):
 
 
 # ----------------------------------------------------------------------
+# Player dimension
+# ----------------------------------------------------------------------
+def build_dim_players(silver_players):
+    """
+    Returns a DataFrame with one row per player_id containing the most
+    recent known identity information (name, position, team, sweater).
+
+    Columns:
+      player_id, first_name, last_name, full_name,
+      position_code, sweater_number, team_id, headshot_url,
+      ingestion_timestamp
+    """
+    w = Window.partitionBy("player_id").orderBy(F.col("game_date").desc())
+
+    return (
+        silver_players
+        .filter(F.col("player_id").isNotNull())
+        .withColumn("_rn", F.row_number().over(w))
+        .filter(F.col("_rn") == 1)
+        .withColumn("ingestion_timestamp", F.current_timestamp())
+        .select(
+            "player_id",
+            "first_name", "last_name", "full_name",
+            "position_code", "sweater_number", "team_id", "headshot_url",
+            "ingestion_timestamp",
+        )
+    )
+
+
+# ----------------------------------------------------------------------
 # Main
 # ----------------------------------------------------------------------
 spark.sql("CREATE SCHEMA IF NOT EXISTS nhl.gold")
 logger.info("Gold schema ready.")
 
-logger.info(f"Reading silver table: {SILVER_TABLE}")
 silver = spark.table(SILVER_TABLE)
 
 logger.info("Building player stats…")
-player_stats = build_player_stats(silver)
-logger.info(f"Writing {PLAYER_STATS_TABLE}…")
 (
-    player_stats.write
+    build_player_stats(silver).write
     .format("delta")
     .mode("overwrite")
     .option("overwriteSchema", "true")
     .saveAsTable(PLAYER_STATS_TABLE)
 )
-ps_count = spark.table(PLAYER_STATS_TABLE).count()
-logger.info(f"Player stats written — {ps_count:,} player-season rows.")
+logger.info(f"Written: {PLAYER_STATS_TABLE}")
 
 logger.info("Building team stats…")
-team_stats = build_team_stats(silver)
-logger.info(f"Writing {TEAM_STATS_TABLE}…")
 (
-    team_stats.write
+    build_team_stats(silver).write
     .format("delta")
     .mode("overwrite")
     .option("overwriteSchema", "true")
     .saveAsTable(TEAM_STATS_TABLE)
 )
-ts_count = spark.table(TEAM_STATS_TABLE).count()
-logger.info(f"Team stats written — {ts_count:,} team-season rows.")
+logger.info(f"Written: {TEAM_STATS_TABLE}")
+
+logger.info("Building player dimension…")
+(
+    build_dim_players(spark.table(SILVER_PLAYERS_TABLE)).write
+    .format("delta")
+    .mode("overwrite")
+    .option("overwriteSchema", "true")
+    .saveAsTable(DIM_PLAYERS_TABLE)
+)
+logger.info(f"Written: {DIM_PLAYERS_TABLE}")
 
 logger.info("batch_gold complete.")
