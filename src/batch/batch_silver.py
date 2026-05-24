@@ -130,6 +130,14 @@ def _ts(v):
             return None
     return v
 
+def _localized(field):
+    """Extract the 'default' locale from an NHL API localised string object."""
+    if field is None:
+        return None
+    if isinstance(field, dict):
+        return field.get("default")
+    return str(field)
+
 # ----------------------------------------------------------------------
 # Schema — one row per play, game context denormalised onto every row
 # ----------------------------------------------------------------------
@@ -205,7 +213,23 @@ SILVER_SCHEMA = StructType([
 ])
 
 # ----------------------------------------------------------------------
-# Ensure silver table exists
+# Schema — one row per player_id (deduplicated to most recent game)
+# ----------------------------------------------------------------------
+PLAYER_SCHEMA = StructType([
+    StructField("player_id",           IntegerType()),
+    StructField("first_name",          StringType()),
+    StructField("last_name",           StringType()),
+    StructField("full_name",           StringType()),
+    StructField("position_code",       StringType()),   # L, R, C, D, G
+    StructField("sweater_number",      IntegerType()),  # most recent known
+    StructField("team_id",             IntegerType()),  # most recent known
+    StructField("headshot_url",        StringType()),
+    StructField("last_seen_game_date", DateType()),
+    StructField("ingestion_timestamp", TimestampType()),
+])
+
+# ----------------------------------------------------------------------
+# Ensure silver tables exist
 # ----------------------------------------------------------------------
 spark.sql("CREATE SCHEMA IF NOT EXISTS nhl.silver")
 
@@ -292,7 +316,22 @@ for col_ddl in [
     except Exception:
         pass  # column already exists
 
-logger.info("Table nhl.silver.nhl_plays is ready")
+spark.sql("""
+    CREATE TABLE IF NOT EXISTS nhl.silver.nhl_players (
+        player_id           INT,
+        first_name          STRING,
+        last_name           STRING,
+        full_name           STRING,
+        position_code       STRING,
+        sweater_number      INT,
+        team_id             INT,
+        headshot_url        STRING,
+        last_seen_game_date DATE,
+        ingestion_timestamp TIMESTAMP
+    ) USING DELTA
+""")
+
+logger.info("Silver tables ready.")
 
 # ----------------------------------------------------------------------
 # Schema validation
@@ -464,6 +503,32 @@ def parse_plays(data: dict, ingestion_ts: datetime) -> list:
     return rows
 
 # ----------------------------------------------------------------------
+# Parse helper — one dict per player from rosterSpots
+# ----------------------------------------------------------------------
+def parse_roster_spots(data: dict, game_date) -> list:
+    rows = []
+    for spot in data.get("rosterSpots") or []:
+        player_id = _int(spot.get("playerId"))
+        if not player_id:
+            continue
+        first = _localized(spot.get("firstName")) or ""
+        last  = _localized(spot.get("lastName"))  or ""
+        rows.append({
+            "player_id":           player_id,
+            "first_name":          first,
+            "last_name":           last,
+            "full_name":           f"{first} {last}".strip() or None,
+            "position_code":       _str(spot.get("positionCode")),
+            "sweater_number":      _int(spot.get("sweaterNumber")),
+            "team_id":             _int(spot.get("teamId")),
+            "headshot_url":        _str(spot.get("headshot")),
+            "last_seen_game_date": game_date,
+            "ingestion_timestamp": None,  # stamped at write time
+        })
+    return rows
+
+
+# ----------------------------------------------------------------------
 # Main execution
 # ----------------------------------------------------------------------
 if __name__ == "__main__":
@@ -473,6 +538,14 @@ if __name__ == "__main__":
     }
     logger.info(f"Games already in silver: {len(existing_game_ids)}")
 
+    # Load existing player records so we can merge in updates from new games
+    players: dict = {}
+    try:
+        for r in spark.table("nhl.silver.nhl_players").collect():
+            players[r.player_id] = r.asDict()
+    except Exception:
+        pass
+
     bronze_rows = spark.sql(
         "SELECT event_id, ingestion_timestamp, raw_json FROM nhl.bronze.nhl_events"
     ).collect()
@@ -480,6 +553,8 @@ if __name__ == "__main__":
 
     buf = []
     processed = skipped = errors = 0
+    new_players_seen = False
+    ingestion_ts = datetime.utcnow()
 
     for row in bronze_rows:
         try:
@@ -494,7 +569,21 @@ if __name__ == "__main__":
 
             validate_game(game_id, data)  # warns on new fields; raises on missing required fields
 
+            game_date = _date(data.get("gameDate"))
+
             buf.extend(parse_plays(data, row.ingestion_timestamp))
+
+            # Update player dict — keep most recent record per player
+            for spot in parse_roster_spots(data, game_date):
+                pid = spot["player_id"]
+                existing = players.get(pid)
+                existing_gd = existing.get("last_seen_game_date") if existing else None
+                if game_date and existing_gd and game_date <= existing_gd:
+                    continue
+                spot["ingestion_timestamp"] = ingestion_ts
+                players[pid] = spot
+                new_players_seen = True
+
             existing_game_ids.add(game_id)
             processed += 1
 
@@ -512,5 +601,12 @@ if __name__ == "__main__":
     if buf:
         logger.info(f"Flushing final chunk — {len(buf)} play rows...")
         _flush(buf, "nhl.silver.nhl_plays", SILVER_SCHEMA)
+
+    if new_players_seen and players:
+        logger.info(f"Writing player dimension — {len(players):,} players...")
+        spark.createDataFrame(list(players.values()), schema=PLAYER_SCHEMA) \
+            .write.format("delta").mode("overwrite").option("overwriteSchema", "true") \
+            .saveAsTable("nhl.silver.nhl_players")
+        logger.info("nhl.silver.nhl_players written.")
 
     logger.info(f"Done. Processed={processed} | Skipped={skipped} | Errors={errors}")
