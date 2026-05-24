@@ -209,27 +209,27 @@ SILVER_SCHEMA = StructType([
     StructField("served_by_player_id",      IntegerType()),
     StructField("stoppage_reason",          StringType()),
     StructField("situation_code",           StringType()),
+    # Player names denormalised from rosterSpots (NULL for pre-API era games)
+    StructField("shooting_player_name",     StringType()),
+    StructField("goalie_in_net_name",       StringType()),
+    StructField("scoring_player_name",      StringType()),
+    StructField("assist1_player_name",      StringType()),
+    StructField("assist2_player_name",      StringType()),
+    StructField("assist3_player_name",      StringType()),
+    StructField("hitting_player_name",      StringType()),
+    StructField("hittee_player_name",       StringType()),
+    StructField("blocking_player_name",     StringType()),
+    StructField("winning_player_name",      StringType()),
+    StructField("losing_player_name",       StringType()),
+    StructField("committed_by_player_name", StringType()),
+    StructField("drawn_by_player_name",      StringType()),
+    StructField("served_by_player_name",    StringType()),
+    StructField("player_name",              StringType()),
     StructField("ingestion_timestamp",      TimestampType()),
 ])
 
 # ----------------------------------------------------------------------
-# Schema — one row per player_id (deduplicated to most recent game)
-# ----------------------------------------------------------------------
-PLAYER_SCHEMA = StructType([
-    StructField("player_id",           IntegerType()),
-    StructField("first_name",          StringType()),
-    StructField("last_name",           StringType()),
-    StructField("full_name",           StringType()),
-    StructField("position_code",       StringType()),   # L, R, C, D, G
-    StructField("sweater_number",      IntegerType()),  # most recent known
-    StructField("team_id",             IntegerType()),  # most recent known
-    StructField("headshot_url",        StringType()),
-    StructField("last_seen_game_date", DateType()),
-    StructField("ingestion_timestamp", TimestampType()),
-])
-
-# ----------------------------------------------------------------------
-# Ensure silver tables exist
+# Ensure silver table exists
 # ----------------------------------------------------------------------
 spark.sql("CREATE SCHEMA IF NOT EXISTS nhl.silver")
 
@@ -299,39 +299,54 @@ spark.sql("""
         drawn_by_player_id      INT,
         served_by_player_id     INT,
         stoppage_reason         STRING,
-        situation_code          STRING,
-        ingestion_timestamp     TIMESTAMP
+        situation_code           STRING,
+        shooting_player_name     STRING,
+        goalie_in_net_name       STRING,
+        scoring_player_name      STRING,
+        assist1_player_name      STRING,
+        assist2_player_name      STRING,
+        assist3_player_name      STRING,
+        hitting_player_name      STRING,
+        hittee_player_name       STRING,
+        blocking_player_name     STRING,
+        winning_player_name      STRING,
+        losing_player_name       STRING,
+        committed_by_player_name STRING,
+        drawn_by_player_name     STRING,
+        served_by_player_name    STRING,
+        player_name              STRING,
+        ingestion_timestamp      TIMESTAMP
     ) USING DELTA
 """)
 
 # Add columns introduced after the table was first created (safe to re-run)
 for col_ddl in [
-    "special_event        STRING",
-    "situation_code       STRING",
-    "assist3_player_id    INT",
-    "assist3_player_total INT",
+    "special_event            STRING",
+    "situation_code           STRING",
+    "assist3_player_id        INT",
+    "assist3_player_total     INT",
+    "shooting_player_name     STRING",
+    "goalie_in_net_name       STRING",
+    "scoring_player_name      STRING",
+    "assist1_player_name      STRING",
+    "assist2_player_name      STRING",
+    "assist3_player_name      STRING",
+    "hitting_player_name      STRING",
+    "hittee_player_name       STRING",
+    "blocking_player_name     STRING",
+    "winning_player_name      STRING",
+    "losing_player_name       STRING",
+    "committed_by_player_name STRING",
+    "drawn_by_player_name     STRING",
+    "served_by_player_name    STRING",
+    "player_name              STRING",
 ]:
     try:
         spark.sql(f"ALTER TABLE nhl.silver.nhl_plays ADD COLUMN {col_ddl}")
     except Exception:
         pass  # column already exists
 
-spark.sql("""
-    CREATE TABLE IF NOT EXISTS nhl.silver.nhl_players (
-        player_id           INT,
-        first_name          STRING,
-        last_name           STRING,
-        full_name           STRING,
-        position_code       STRING,
-        sweater_number      INT,
-        team_id             INT,
-        headshot_url        STRING,
-        last_seen_game_date DATE,
-        ingestion_timestamp TIMESTAMP
-    ) USING DELTA
-""")
-
-logger.info("Silver tables ready.")
+logger.info("Silver table ready.")
 
 # ----------------------------------------------------------------------
 # Schema validation
@@ -416,7 +431,7 @@ def validate_game(game_id: int, data: dict) -> None:
 # ----------------------------------------------------------------------
 # Parse helper — one dict per play with game context embedded
 # ----------------------------------------------------------------------
-def parse_plays(data: dict, ingestion_ts: datetime) -> list:
+def parse_plays(data: dict, ingestion_ts: datetime, player_names: dict) -> list:
     away    = data.get("awayTeam", {}) or {}
     home    = data.get("homeTeam", {}) or {}
     outcome = data.get("gameOutcome", {}) or {}
@@ -496,36 +511,41 @@ def parse_plays(data: dict, ingestion_ts: datetime) -> list:
             "committed_by_player_id":   _int(d.get("committedByPlayerId")),
             "drawn_by_player_id":       _int(d.get("drawnByPlayerId")),
             "served_by_player_id":      _int(d.get("servedByPlayerId")),
-            "stoppage_reason":          _str(d.get("reason")),
-            "situation_code":           _str(play.get("situationCode")),
+            "stoppage_reason":           _str(d.get("reason")),
+            "situation_code":            _str(play.get("situationCode")),
+            # Player names looked up from this game's rosterSpots
+            "shooting_player_name":      player_names.get(_int(d.get("shootingPlayerId"))),
+            "goalie_in_net_name":        player_names.get(_int(d.get("goalieInNetId"))),
+            "scoring_player_name":       player_names.get(_int(d.get("scoringPlayerId"))),
+            "assist1_player_name":       player_names.get(_int(d.get("assist1PlayerId"))),
+            "assist2_player_name":       player_names.get(_int(d.get("assist2PlayerId"))),
+            "assist3_player_name":       player_names.get(_int(d.get("assist3PlayerId"))),
+            "hitting_player_name":       player_names.get(_int(d.get("hittingPlayerId"))),
+            "hittee_player_name":        player_names.get(_int(d.get("hitteePlayerId"))),
+            "blocking_player_name":      player_names.get(_int(d.get("blockingPlayerId"))),
+            "winning_player_name":       player_names.get(_int(d.get("winningPlayerId"))),
+            "losing_player_name":        player_names.get(_int(d.get("losingPlayerId"))),
+            "committed_by_player_name":  player_names.get(_int(d.get("committedByPlayerId"))),
+            "drawn_by_player_name":      player_names.get(_int(d.get("drawnByPlayerId"))),
+            "served_by_player_name":     player_names.get(_int(d.get("servedByPlayerId"))),
+            "player_name":               player_names.get(_int(d.get("playerId"))),
         }
         rows.append(row)
     return rows
 
 # ----------------------------------------------------------------------
-# Parse helper — one dict per player from rosterSpots
+# Parse helper — {player_id: full_name} lookup from rosterSpots
 # ----------------------------------------------------------------------
-def parse_roster_spots(data: dict, game_date) -> list:
-    rows = []
+def _player_names(data: dict) -> dict:
+    names = {}
     for spot in data.get("rosterSpots") or []:
         player_id = _int(spot.get("playerId"))
         if not player_id:
             continue
         first = _localized(spot.get("firstName")) or ""
         last  = _localized(spot.get("lastName"))  or ""
-        rows.append({
-            "player_id":           player_id,
-            "first_name":          first,
-            "last_name":           last,
-            "full_name":           f"{first} {last}".strip() or None,
-            "position_code":       _str(spot.get("positionCode")),
-            "sweater_number":      _int(spot.get("sweaterNumber")),
-            "team_id":             _int(spot.get("teamId")),
-            "headshot_url":        _str(spot.get("headshot")),
-            "last_seen_game_date": game_date,
-            "ingestion_timestamp": None,  # stamped at write time
-        })
-    return rows
+        names[player_id] = f"{first} {last}".strip() or None
+    return names
 
 
 # ----------------------------------------------------------------------
@@ -538,14 +558,6 @@ if __name__ == "__main__":
     }
     logger.info(f"Games already in silver: {len(existing_game_ids)}")
 
-    # Load existing player records so we can merge in updates from new games
-    players: dict = {}
-    try:
-        for r in spark.table("nhl.silver.nhl_players").collect():
-            players[r.player_id] = r.asDict()
-    except Exception:
-        pass
-
     bronze_rows = spark.sql(
         "SELECT event_id, ingestion_timestamp, raw_json FROM nhl.bronze.nhl_events"
     ).collect()
@@ -553,8 +565,6 @@ if __name__ == "__main__":
 
     buf = []
     processed = skipped = errors = 0
-    new_players_seen = False
-    ingestion_ts = datetime.utcnow()
 
     for row in bronze_rows:
         try:
@@ -569,21 +579,7 @@ if __name__ == "__main__":
 
             validate_game(game_id, data)  # warns on new fields; raises on missing required fields
 
-            game_date = _date(data.get("gameDate"))
-
-            buf.extend(parse_plays(data, row.ingestion_timestamp))
-
-            # Update player dict — keep most recent record per player
-            for spot in parse_roster_spots(data, game_date):
-                pid = spot["player_id"]
-                existing = players.get(pid)
-                existing_gd = existing.get("last_seen_game_date") if existing else None
-                if game_date and existing_gd and game_date <= existing_gd:
-                    continue
-                spot["ingestion_timestamp"] = ingestion_ts
-                players[pid] = spot
-                new_players_seen = True
-
+            buf.extend(parse_plays(data, row.ingestion_timestamp, _player_names(data)))
             existing_game_ids.add(game_id)
             processed += 1
 
@@ -601,12 +597,5 @@ if __name__ == "__main__":
     if buf:
         logger.info(f"Flushing final chunk — {len(buf)} play rows...")
         _flush(buf, "nhl.silver.nhl_plays", SILVER_SCHEMA)
-
-    if new_players_seen and players:
-        logger.info(f"Writing player dimension — {len(players):,} players...")
-        spark.createDataFrame(list(players.values()), schema=PLAYER_SCHEMA) \
-            .write.format("delta").mode("overwrite").option("overwriteSchema", "true") \
-            .saveAsTable("nhl.silver.nhl_players")
-        logger.info("nhl.silver.nhl_players written.")
 
     logger.info(f"Done. Processed={processed} | Skipped={skipped} | Errors={errors}")

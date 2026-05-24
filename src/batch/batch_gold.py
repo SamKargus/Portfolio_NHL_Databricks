@@ -38,11 +38,10 @@ logging.basicConfig(
 logger = logging.getLogger("batch_gold")
 logger.info(f"batch_gold started — log: {log_file}")
 
-SILVER_TABLE         = "nhl.silver.nhl_plays"
-SILVER_PLAYERS_TABLE = "nhl.silver.nhl_players"
-PLAYER_STATS_TABLE   = "nhl.gold.player_stats"
-TEAM_STATS_TABLE     = "nhl.gold.team_stats"
-DIM_PLAYERS_TABLE    = "nhl.gold.dim_players"
+SILVER_TABLE       = "nhl.silver.nhl_plays"
+PLAYER_STATS_TABLE = "nhl.gold.player_stats"
+TEAM_STATS_TABLE   = "nhl.gold.team_stats"
+DIM_PLAYERS_TABLE  = "nhl.gold.dim_players"
 
 # situation_code layout: [away_goalie][away_skaters][home_skaters][home_goalie]
 # e.g. "1551" = even strength 5v5 with both goalies on ice
@@ -414,29 +413,52 @@ def build_team_stats(silver):
 # ----------------------------------------------------------------------
 # Player dimension
 # ----------------------------------------------------------------------
-def build_dim_players(silver_players):
+def build_dim_players(silver):
     """
-    Returns a DataFrame with one row per player_id.
+    Returns a DataFrame with one row per player_id sourced from the name
+    columns embedded in nhl.silver.nhl_plays.
 
-    nhl.silver.nhl_players is already deduplicated to the most recent
-    known record per player, so this just selects the gold-facing columns
-    and refreshes the ingestion timestamp.
+    Unions every (player_id, player_name) pair across all player role
+    columns, then deduplicates to the single most-seen name per player.
 
-    Columns:
-      player_id, first_name, last_name, full_name,
-      position_code, sweater_number, team_id, headshot_url,
-      ingestion_timestamp
+    Columns: player_id, player_name, ingestion_timestamp
     """
-    return (
-        silver_players
-        .filter(F.col("player_id").isNotNull())
-        .withColumn("ingestion_timestamp", F.current_timestamp())
-        .select(
-            "player_id",
-            "first_name", "last_name", "full_name",
-            "position_code", "sweater_number", "team_id", "headshot_url",
-            "ingestion_timestamp",
+    id_name_pairs = [
+        ("scoring_player_id",      "scoring_player_name"),
+        ("assist1_player_id",      "assist1_player_name"),
+        ("assist2_player_id",      "assist2_player_name"),
+        ("assist3_player_id",      "assist3_player_name"),
+        ("shooting_player_id",     "shooting_player_name"),
+        ("goalie_in_net_id",       "goalie_in_net_name"),
+        ("hitting_player_id",      "hitting_player_name"),
+        ("hittee_player_id",       "hittee_player_name"),
+        ("blocking_player_id",     "blocking_player_name"),
+        ("winning_player_id",      "winning_player_name"),
+        ("losing_player_id",       "losing_player_name"),
+        ("committed_by_player_id", "committed_by_player_name"),
+        ("drawn_by_player_id",     "drawn_by_player_name"),
+        ("served_by_player_id",    "served_by_player_name"),
+        ("player_id",              "player_name"),
+    ]
+
+    pairs = None
+    for id_col, name_col in id_name_pairs:
+        subset = (
+            silver
+            .filter(F.col(id_col).isNotNull())
+            .filter(F.col(name_col).isNotNull())
+            .select(
+                F.col(id_col).alias("player_id"),
+                F.col(name_col).alias("player_name"),
+            )
         )
+        pairs = subset if pairs is None else pairs.union(subset)
+
+    return (
+        pairs
+        .dropDuplicates(["player_id"])
+        .withColumn("ingestion_timestamp", F.current_timestamp())
+        .select("player_id", "player_name", "ingestion_timestamp")
     )
 
 
@@ -470,7 +492,7 @@ logger.info(f"Written: {TEAM_STATS_TABLE}")
 
 logger.info("Building player dimension…")
 (
-    build_dim_players(spark.table(SILVER_PLAYERS_TABLE)).write
+    build_dim_players(silver).write
     .format("delta")
     .mode("overwrite")
     .option("overwriteSchema", "true")
