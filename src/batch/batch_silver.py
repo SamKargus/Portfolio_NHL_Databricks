@@ -28,7 +28,8 @@ logging.basicConfig(
 logger = logging.getLogger("batch_silver")
 logger.info(f"batch_silver started — log: {log_file}")
 
-CHUNK_SIZE = 500  # flush to Delta every N games
+CHUNK_SIZE = 500         # flush play rows to Delta every N games
+BRONZE_BATCH_SIZE = 50  # raw JSON rows fetched from bronze per batch
 MAX_FLUSH_RETRIES = 5
 FLUSH_RETRY_BASE_DELAY = 30  # seconds; doubles each attempt (30, 60, 120, 240, ...)
 
@@ -558,41 +559,52 @@ if __name__ == "__main__":
     }
     logger.info(f"Games already in silver: {len(existing_game_ids)}")
 
-    bronze_rows = spark.sql(
-        "SELECT event_id, ingestion_timestamp, raw_json FROM nhl.bronze.nhl_events"
-    ).collect()
-    logger.info(f"Bronze rows to evaluate: {len(bronze_rows)}")
+    # Collect only event_ids first — avoids loading all raw JSON into driver memory
+    all_event_ids = sorted(
+        r.event_id
+        for r in spark.sql("SELECT event_id FROM nhl.bronze.nhl_events").collect()
+    )
+    logger.info(f"Bronze rows to evaluate: {len(all_event_ids)}")
 
     buf = []
     processed = skipped = errors = 0
 
-    for row in bronze_rows:
-        try:
-            data    = json.loads(row.raw_json)
-            game_id = data.get("id")
-            if not game_id:
-                continue
+    for batch_start in range(0, len(all_event_ids), BRONZE_BATCH_SIZE):
+        batch_ids = all_event_ids[batch_start:batch_start + BRONZE_BATCH_SIZE]
+        ids_csv   = ",".join(str(eid) for eid in batch_ids)
 
-            if game_id in existing_game_ids:
-                skipped += 1
-                continue
+        batch_rows = spark.sql(
+            f"SELECT event_id, ingestion_timestamp, raw_json "
+            f"FROM nhl.bronze.nhl_events WHERE event_id IN ({ids_csv})"
+        ).collect()
 
-            validate_game(game_id, data)  # warns on new fields; raises on missing required fields
+        for row in batch_rows:
+            try:
+                data    = json.loads(row.raw_json)
+                game_id = data.get("id")
+                if not game_id:
+                    continue
 
-            buf.extend(parse_plays(data, row.ingestion_timestamp, _player_names(data)))
-            existing_game_ids.add(game_id)
-            processed += 1
+                if game_id in existing_game_ids:
+                    skipped += 1
+                    continue
 
-            if processed % CHUNK_SIZE == 0:
-                logger.info(f"Flushing chunk — {processed} games, {len(buf)} play rows...")
-                _flush(buf, "nhl.silver.nhl_plays", SILVER_SCHEMA)
-                buf = []
+                validate_game(game_id, data)  # warns on new fields; raises on missing required fields
 
-        except ValueError:
-            raise  # missing required field — halt immediately
-        except Exception as e:
-            logger.error(f"Failed on bronze row (event_id={row.event_id}): {e}")
-            errors += 1
+                buf.extend(parse_plays(data, row.ingestion_timestamp, _player_names(data)))
+                existing_game_ids.add(game_id)
+                processed += 1
+
+                if processed % CHUNK_SIZE == 0:
+                    logger.info(f"Flushing chunk — {processed} games, {len(buf)} play rows...")
+                    _flush(buf, "nhl.silver.nhl_plays", SILVER_SCHEMA)
+                    buf = []
+
+            except ValueError:
+                raise  # missing required field — halt immediately
+            except Exception as e:
+                logger.error(f"Failed on bronze row (event_id={row.event_id}): {e}")
+                errors += 1
 
     if buf:
         logger.info(f"Flushing final chunk — {len(buf)} play rows...")
