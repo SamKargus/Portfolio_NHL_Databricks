@@ -17,7 +17,7 @@ silver data.  The script is idempotent and safe to re-run at any time.
 import logging
 from pathlib import Path
 from datetime import datetime
-from pyspark.sql import functions as F, Window
+from pyspark.sql import functions as F
 
 # ----------------------------------------------------------------------
 # Setup (run once)
@@ -416,21 +416,20 @@ def build_team_stats(silver):
 # ----------------------------------------------------------------------
 def build_dim_players(silver_players):
     """
-    Returns a DataFrame with one row per player_id containing the most
-    recent known identity information (name, position, team, sweater).
+    Returns a DataFrame with one row per player_id.
+
+    nhl.silver.nhl_players is already deduplicated to the most recent
+    known record per player, so this just selects the gold-facing columns
+    and refreshes the ingestion timestamp.
 
     Columns:
       player_id, first_name, last_name, full_name,
       position_code, sweater_number, team_id, headshot_url,
       ingestion_timestamp
     """
-    w = Window.partitionBy("player_id").orderBy(F.col("game_date").desc())
-
     return (
         silver_players
         .filter(F.col("player_id").isNotNull())
-        .withColumn("_rn", F.row_number().over(w))
-        .filter(F.col("_rn") == 1)
         .withColumn("ingestion_timestamp", F.current_timestamp())
         .select(
             "player_id",
