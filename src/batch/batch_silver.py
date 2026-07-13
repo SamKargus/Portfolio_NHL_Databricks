@@ -76,11 +76,11 @@ KNOWN_TEAM_FIELDS = REQUIRED_TEAM_FIELDS | {
 REQUIRED_PLAY_FIELDS = {"eventId", "typeCode", "typeDescKey", "sortOrder"}
 KNOWN_PLAY_FIELDS = REQUIRED_PLAY_FIELDS | {
     "periodDescriptor", "timeInPeriod", "timeRemaining", "details",
-    "situationCode",
+    "situationCode", "homeTeamDefendingSide", "pptReplayUrl",
 }
 
 KNOWN_DETAIL_FIELDS = {
-    "xCoord", "yCoord", "eventOwnerTeamId", "shotType",
+    "xCoord", "yCoord", "zoneCode", "eventOwnerTeamId", "shotType",
     "shootingPlayerId", "goalieInNetId",
     "scoringPlayerId", "scoringPlayerTotal",
     "assist1PlayerId", "assist1PlayerTotal",
@@ -93,7 +93,10 @@ KNOWN_DETAIL_FIELDS = {
     "playerId",
     "typeCode", "descKey", "duration",
     "committedByPlayerId", "drawnByPlayerId", "servedByPlayerId",
-    "reason",
+    "reason", "secondaryReason",
+    "highlightClip", "highlightClipFr",
+    "highlightClipSharingUrl", "highlightClipSharingUrlFr",
+    "discreteClip", "discreteClipFr",
 }
 
 # Dedup set — each warning string fires at most once per run
@@ -180,6 +183,8 @@ SILVER_SCHEMA = StructType([
     StructField("sort_order",               IntegerType()),
     StructField("x_coord",                  IntegerType()),
     StructField("y_coord",                  IntegerType()),
+    StructField("zone_code",                StringType()),
+    StructField("home_team_defending_side", StringType()),
     StructField("event_owner_team_id",      IntegerType()),
     StructField("shot_type",                StringType()),
     StructField("scoring_player_total",     IntegerType()),
@@ -194,6 +199,7 @@ SILVER_SCHEMA = StructType([
     StructField("penalty_desc_key",         StringType()),
     StructField("penalty_duration",         IntegerType()),
     StructField("stoppage_reason",          StringType()),
+    StructField("secondary_stoppage_reason", StringType()),
     StructField("situation_code",           StringType()),
     # Player names denormalised from rosterSpots (NULL for pre-API era games)
     StructField("shooting_player_name",     StringType()),
@@ -211,6 +217,14 @@ SILVER_SCHEMA = StructType([
     StructField("drawn_by_player_name",      StringType()),
     StructField("served_by_player_name",    StringType()),
     StructField("player_name",              StringType()),
+    # Media / video clips
+    StructField("highlight_clip",               LongType()),
+    StructField("highlight_clip_fr",            LongType()),
+    StructField("highlight_clip_sharing_url",    StringType()),
+    StructField("highlight_clip_sharing_url_fr", StringType()),
+    StructField("discrete_clip",                LongType()),
+    StructField("discrete_clip_fr",             LongType()),
+    StructField("ppt_replay_url",               StringType()),
     StructField("ingestion_timestamp",      TimestampType()),
 ])
 
@@ -256,6 +270,8 @@ spark.sql("""
         sort_order              INT,
         x_coord                 INT,
         y_coord                 INT,
+        zone_code               STRING,
+        home_team_defending_side STRING,
         event_owner_team_id     INT,
         shot_type               STRING,
         scoring_player_total    INT,
@@ -270,6 +286,7 @@ spark.sql("""
         penalty_desc_key        STRING,
         penalty_duration        INT,
         stoppage_reason         STRING,
+        secondary_stoppage_reason STRING,
         situation_code           STRING,
         shooting_player_name     STRING,
         goalie_in_net_name       STRING,
@@ -286,6 +303,13 @@ spark.sql("""
         drawn_by_player_name     STRING,
         served_by_player_name    STRING,
         player_name              STRING,
+        highlight_clip               BIGINT,
+        highlight_clip_fr            BIGINT,
+        highlight_clip_sharing_url    STRING,
+        highlight_clip_sharing_url_fr STRING,
+        discrete_clip                BIGINT,
+        discrete_clip_fr             BIGINT,
+        ppt_replay_url               STRING,
         ingestion_timestamp      TIMESTAMP
     ) USING DELTA
 """)
@@ -310,6 +334,16 @@ for col_ddl in [
     "drawn_by_player_name     STRING",
     "served_by_player_name    STRING",
     "player_name              STRING",
+    "zone_code                STRING",
+    "home_team_defending_side STRING",
+    "secondary_stoppage_reason STRING",
+    "highlight_clip               BIGINT",
+    "highlight_clip_fr            BIGINT",
+    "highlight_clip_sharing_url    STRING",
+    "highlight_clip_sharing_url_fr STRING",
+    "discrete_clip                BIGINT",
+    "discrete_clip_fr             BIGINT",
+    "ppt_replay_url               STRING",
 ]:
     try:
         spark.sql(f"ALTER TABLE nhl.silver.nhl_plays ADD COLUMN {col_ddl}")
@@ -453,6 +487,8 @@ def parse_plays(data: dict, ingestion_ts: datetime, player_names: dict) -> list:
             "sort_order":               _int(play.get("sortOrder")),
             "x_coord":                  _int(d.get("xCoord")),
             "y_coord":                  _int(d.get("yCoord")),
+            "zone_code":                _str(d.get("zoneCode")),
+            "home_team_defending_side": _str(play.get("homeTeamDefendingSide")),
             "event_owner_team_id":      _int(d.get("eventOwnerTeamId")),
             "shot_type":                _str(d.get("shotType")),
             "scoring_player_total":     _int(d.get("scoringPlayerTotal")),
@@ -467,6 +503,7 @@ def parse_plays(data: dict, ingestion_ts: datetime, player_names: dict) -> list:
             "penalty_desc_key":         _str(d.get("descKey")),
             "penalty_duration":         _int(d.get("duration")),
             "stoppage_reason":          _str(d.get("reason")),
+            "secondary_stoppage_reason": _str(d.get("secondaryReason")),
             "situation_code":            _str(play.get("situationCode")),
             # Player names looked up from this game's rosterSpots
             "shooting_player_name":      player_names.get(_int(d.get("shootingPlayerId"))),
@@ -484,6 +521,14 @@ def parse_plays(data: dict, ingestion_ts: datetime, player_names: dict) -> list:
             "drawn_by_player_name":      player_names.get(_int(d.get("drawnByPlayerId"))),
             "served_by_player_name":     player_names.get(_int(d.get("servedByPlayerId"))),
             "player_name":               player_names.get(_int(d.get("playerId"))),
+            # Media / video clips
+            "highlight_clip":                _long(d.get("highlightClip")),
+            "highlight_clip_fr":             _long(d.get("highlightClipFr")),
+            "highlight_clip_sharing_url":     _str(d.get("highlightClipSharingUrl")),
+            "highlight_clip_sharing_url_fr":  _str(d.get("highlightClipSharingUrlFr")),
+            "discrete_clip":                 _long(d.get("discreteClip")),
+            "discrete_clip_fr":              _long(d.get("discreteClipFr")),
+            "ppt_replay_url":                 _str(play.get("pptReplayUrl")),
         }
         rows.append(row)
     return rows
