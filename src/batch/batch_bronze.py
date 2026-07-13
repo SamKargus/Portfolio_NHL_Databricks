@@ -116,7 +116,7 @@ def get_all_game_ids(start: date, end: date) -> list:
         ids.extend(week_ids)
         logger.info(f"Week of {current} → {len(week_ids)} games")
         current += timedelta(weeks=1)
-        time.sleep(0.2)
+        time.sleep(0.3)
     return ids
 
 # ----------------------------------------------------------------------
@@ -124,7 +124,7 @@ def get_all_game_ids(start: date, end: date) -> list:
 # ----------------------------------------------------------------------
 if __name__ == "__main__":
     # ----- Set your desired date range -----
-    START_DATE = date(1969, 8, 1)
+    START_DATE = date(1916, 1, 1)
     END_DATE   = date.today()
 
     logger.info(f"Collecting game IDs from {START_DATE} to {END_DATE}")
@@ -146,6 +146,6 @@ if __name__ == "__main__":
         if process_game(gid):
             success_count += 1
         # A small pause between requests to be kind to the API
-        time.sleep(0.2)
+        time.sleep(0.3)
 
     logger.info(f"Done. Successfully stored {success_count}/{len(new_games)} new games.")
