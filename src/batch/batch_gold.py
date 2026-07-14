@@ -23,7 +23,9 @@ and collision-free.
    dim_event_type ─────────────────┘
 
 Tables produced (all fully overwritten each run — idempotent, safe to re-run):
-  nhl.gold.dim_player      one row per player_id
+  nhl.gold.dim_player      one row per player_id (Type 1 — current attributes)
+  nhl.gold.dim_player_team player↔team stint history (trades) with valid_from/
+                           valid_to/is_current — the slowly-changing part
   nhl.gold.dim_team        one row per team_id
   nhl.gold.dim_game        one row per game_id
   nhl.gold.dim_date        one row per calendar date present in the data
@@ -62,6 +64,7 @@ logger.info(f"batch_gold started — log: {log_file}")
 BRONZE_TABLE = "nhl.bronze.nhl_events"
 
 DIM_PLAYER_TABLE     = "nhl.gold.dim_player"
+DIM_PLAYER_TEAM_TABLE = "nhl.gold.dim_player_team"
 DIM_TEAM_TABLE       = "nhl.gold.dim_team"
 DIM_GAME_TABLE       = "nhl.gold.dim_game"
 DIM_DATE_TABLE       = "nhl.gold.dim_date"
@@ -260,6 +263,78 @@ def build_dim_player(games):
             "player_id", "full_name", "first_name", "last_name",
             "position_code", "sweater_number", "team_id", "headshot_url",
             "first_seen_date", "last_seen_date", "ingestion_timestamp",
+        )
+    )
+
+
+def build_dim_player_team(games):
+    """
+    Player↔team stint history (the slowly-changing part of a player's identity).
+    One row per contiguous spell a player spent on a team, derived from per-game
+    rosterSpots. Captures trades — including mid-season moves and a player
+    returning to a former team (each spell is its own stint).
+
+    Grain: (player_id, team_id, valid_from). Columns:
+      player_id, team_id, valid_from, valid_to, games_in_stint, is_current
+    """
+    spots = (
+        games
+        .select("game_date", F.explode("rosterSpots").alias("s"))
+        .select(
+            F.col("game_date"),
+            F.col("s.playerId").alias("player_id"),
+            F.col("s.teamId").alias("team_id"),
+        )
+        .filter(
+            F.col("player_id").isNotNull()
+            & F.col("team_id").isNotNull()
+            & F.col("game_date").isNotNull()
+        )
+    )
+
+    # Collapse to one team per player per game (guards against any duplicate spots).
+    one_per_game = Window.partitionBy("player_id", "game_date").orderBy(F.col("team_id"))
+    per_game = (
+        spots
+        .withColumn("_rn", F.row_number().over(one_per_game))
+        .filter(F.col("_rn") == 1)
+        .drop("_rn")
+    )
+
+    # Gaps-and-islands: a new stint begins whenever the team differs from the
+    # team in the player's previous game (chronologically).
+    order = Window.partitionBy("player_id").orderBy("game_date")
+    flagged = (
+        per_game
+        .withColumn("prev_team", F.lag("team_id").over(order))
+        .withColumn(
+            "is_new_stint",
+            (F.col("prev_team").isNull() | (F.col("prev_team") != F.col("team_id"))).cast("int"),
+        )
+        .withColumn("stint_id", F.sum("is_new_stint").over(order))  # running island id
+    )
+
+    stints = (
+        flagged
+        .groupBy("player_id", "stint_id", "team_id")
+        .agg(
+            F.min("game_date").alias("valid_from"),
+            F.max("game_date").alias("valid_to"),
+            F.count("*").alias("games_in_stint"),
+        )
+    )
+
+    # The player's most recent stint is the current one.
+    current = Window.partitionBy("player_id").orderBy(F.col("valid_from").desc())
+    return (
+        stints
+        .withColumn("_rn", F.row_number().over(current))
+        .withColumn("is_current", F.col("_rn") == 1)
+        .drop("_rn", "stint_id")
+        .withColumn("ingestion_timestamp", F.current_timestamp())
+        .select(
+            "player_id", "team_id", "valid_from", "valid_to",
+            "games_in_stint", "is_current", "ingestion_timestamp",
         )
     )
 
@@ -472,6 +547,9 @@ logger.info(f"Canonical games parsed: {games.count()}")
 
 logger.info("Building dim_player…")
 overwrite_table(build_dim_player(games), DIM_PLAYER_TABLE)
+
+logger.info("Building dim_player_team…")
+overwrite_table(build_dim_player_team(games), DIM_PLAYER_TEAM_TABLE)
 
 logger.info("Building dim_team…")
 overwrite_table(build_dim_team(games), DIM_TEAM_TABLE)
