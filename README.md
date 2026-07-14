@@ -1,6 +1,6 @@
 # NHL Play-by-Play Data Pipeline
 
-A batch data engineering pipeline that ingests every NHL play-by-play game from the NHL public API into a Databricks Lakehouse using the **Medallion Architecture** (Bronze → Silver). The pipeline covers the full history of NHL games from the 1917-18 season to the present day.
+A batch data engineering pipeline that ingests every NHL play-by-play game from the NHL public API into a Databricks Lakehouse using the **Medallion Architecture** (Bronze → Silver → Gold). The pipeline covers the full history of NHL games from the 1917-18 season to the present day.
 
 ---
 
@@ -20,9 +20,15 @@ NHL Public API
 │  SILVER  nhl.silver.nhl_plays       │  Parsed, typed, denormalised
 │  1 row per play event               │
 └─────────────────────────────────────┘
+      │
+      ▼
+┌─────────────────────────────────────┐
+│  GOLD  nhl.gold.*                   │  Kimball star schema
+│  fact_event + conformed dimensions  │
+└─────────────────────────────────────┘
 ```
 
-Both layers are **Delta tables** stored in a Unity Catalog (`nhl`).
+All layers are **Delta tables** stored in a Unity Catalog (`nhl`). Gold is built directly from **bronze**, not silver — see [Gold](#gold--batch_goldpy) for why.
 
 ---
 
@@ -32,7 +38,8 @@ Both layers are **Delta tables** stored in a Unity Catalog (`nhl`).
 ├── src/
 │   └── batch/
 │       ├── batch_bronze.py   # Ingests raw JSON from the NHL API → bronze
-│       └── batch_silver.py   # Parses and flattens bronze JSON → silver
+│       ├── batch_silver.py   # Parses and flattens bronze JSON → silver
+│       └── batch_gold.py     # Models bronze JSON into a star schema → gold
 ├── SQL/
 │   └── initTables/           # DDL notebooks for manual table setup
 ├── great_expectations/       # Data quality framework (in progress)
@@ -131,6 +138,33 @@ New columns are added to the live table via `ALTER TABLE` statements that run on
 
 ---
 
+### Gold — `batch_gold.py`
+
+A **Kimball star schema** — a single atomic fact table at *play* grain surrounded by conformed dimensions. All tables are fully overwritten each run (idempotent, safe to re-run) and use **natural business keys** (real `player_id` / `team_id` / `game_id` / `yyyymmdd` `date_key`) as join keys, which are friendlier for ad-hoc SQL than opaque surrogates and collision-free.
+
+**Built from bronze, not silver.** Silver is deliberately left un-modelled: it is flat, denormalised, and carries player *names* but no player *ids*. Gold re-parses the bronze JSON (`from_json` + `explode`, fully distributed — no driver-side work) because bronze is the only place that still holds real NHL `player_id`s (in each play's `details` and in `rosterSpots`). Linking facts to players by name would reintroduce the duplicate-name collisions (e.g. two "Sebastian Aho") the id-based model exists to avoid.
+
+```
+        dim_date ─┐                 ┌─ dim_team
+                  ├──  fact_event  ─┤
+        dim_game ─┘                 ├─ dim_player  (role-playing)
+   dim_event_type ─────────────────┘
+```
+
+| Table | Grain | Notes |
+|-------|-------|-------|
+| `fact_event` | one row per play `(game_id, event_id)` | Role-playing `player_id` FKs per play role (scorer, assists 1–3, shooter, goalie, hitter, hittee, blocker, faceoff win/lose, penalty committed/drawn/served, generic). `event_owner_team_id` gives team-at-time-of-event. |
+| `dim_player` | one row per `player_id` | **Type 1** — current descriptive attributes only. |
+| `dim_player_team` | one row per contiguous `(player_id, team_id)` spell | Player↔team **stint history** — the SCD for trades, with `valid_from` / `valid_to` / `is_current` / `games_in_stint`, derived from per-game `rosterSpots` via gaps-and-islands. Kept off `dim_player` so `player_id` stays a clean unique FK on the fact. |
+| `dim_team` | one row per `team_id` | Most recent team attributes (abbrev, name, logos). |
+| `dim_game` | one row per `game_id` | Game-level context (season, `game_type`, venue, final score/SOG, outcome). |
+| `dim_date` | one row per calendar date | Standard calendar dimension keyed by `yyyymmdd` `date_key`. |
+| `dim_event_type` | one row per `type_code` | Event-type lookup, derived from the fact. |
+
+Primary consumer is **ad-hoc SQL / notebooks**. Older non-dimensional gold tables (`player_stats`, `team_stats`, `dim_players`) are dropped by this script as superseded.
+
+---
+
 ## Setup
 
 ### Prerequisites
@@ -157,7 +191,11 @@ Then run `batch_bronze.py`. On the first run this will take several hours to bac
 
 Run `batch_silver.py` after bronze completes. No configuration needed — it automatically detects and processes all bronze rows not yet in silver.
 
-Both scripts are safe to re-run at any time.
+**Step 3 — Gold modelling**
+
+Run `batch_gold.py` after bronze completes (it reads bronze, so it does not depend on silver). No configuration needed — it fully rebuilds the star schema each run.
+
+All three scripts are safe to re-run at any time.
 
 ---
 
