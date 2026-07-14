@@ -1,23 +1,44 @@
 """
-Gold layer — aggregated player and team statistics derived from the silver tables.
+Gold layer — a Kimball-style star schema over NHL play-by-play data.
 
-Produces three tables:
-  nhl.gold.player_stats  — per-player, per-season, per-game-type aggregates
-                           (goals, assists, points, shots, hits, faceoffs, PIM, …)
-  nhl.gold.team_stats    — per-team, per-season, per-game-type aggregates
-                           (wins, losses, goals, shots, PP goals, SH goals, PIM, …)
-  nhl.gold.dim_players   — one row per player (most recent known name, position,
-                           team, sweater number, headshot URL) sourced from
-                           nhl.silver.nhl_players; join to player_stats on player_id
+Silver (nhl.silver.nhl_plays) is intentionally left un-modelled: it is a flat,
+denormalised, name-only view of every play. Gold is where the dimensional model
+lives. Because silver deliberately carries player *names* but no player *ids*,
+this layer is built directly from the bronze JSON (nhl.bronze.nhl_events), which
+is the only place that still holds real NHL player ids (in each play's `details`
+and in `rosterSpots`). Linking facts to players by name would re-introduce the
+duplicate-name collisions the id-based model exists to avoid, so gold re-parses
+bronze rather than reading silver.
 
-All tables are fully overwritten on each run so they always reflect current
-silver data.  The script is idempotent and safe to re-run at any time.
+Grain & paradigm
+----------------
+A single atomic fact table at *play* grain, surrounded by conformed dimensions.
+Natural business keys (real player_id / team_id / game_id / yyyymmdd date_key)
+are used as the join keys — friendlier for ad-hoc SQL than opaque surrogates,
+and collision-free.
+
+        dim_date ─┐                 ┌─ dim_team
+                  ├──  fact_event  ─┤
+        dim_game ─┘                 ├─ dim_player  (role-playing)
+   dim_event_type ─────────────────┘
+
+Tables produced (all fully overwritten each run — idempotent, safe to re-run):
+  nhl.gold.dim_player      one row per player_id
+  nhl.gold.dim_team        one row per team_id
+  nhl.gold.dim_game        one row per game_id
+  nhl.gold.dim_date        one row per calendar date present in the data
+  nhl.gold.dim_event_type  one row per event type_code
+  nhl.gold.fact_event      one row per play; real player-id FK per role
+
+The parsing is fully distributed (from_json + explode) — no driver-side JSON
+work, so there is no OOM risk regardless of game count.
 """
 
 import logging
 from pathlib import Path
 from datetime import datetime
-from pyspark.sql import functions as F
+
+from pyspark.sql import functions as F, types as T, Window
 
 # ----------------------------------------------------------------------
 # Setup (run once)
@@ -38,411 +59,394 @@ logging.basicConfig(
 logger = logging.getLogger("batch_gold")
 logger.info(f"batch_gold started — log: {log_file}")
 
-SILVER_TABLE       = "nhl.silver.nhl_plays"
-PLAYER_STATS_TABLE = "nhl.gold.player_stats"
-TEAM_STATS_TABLE   = "nhl.gold.team_stats"
-DIM_PLAYERS_TABLE  = "nhl.gold.dim_players"
+BRONZE_TABLE = "nhl.bronze.nhl_events"
 
-# situation_code layout: [away_goalie][away_skaters][home_skaters][home_goalie]
-# e.g. "1551" = even strength 5v5 with both goalies on ice
-_SC_AWAY_SK = F.col("situation_code").substr(2, 1).cast("int")
-_SC_HOME_SK = F.col("situation_code").substr(3, 1).cast("int")
+DIM_PLAYER_TABLE     = "nhl.gold.dim_player"
+DIM_TEAM_TABLE       = "nhl.gold.dim_team"
+DIM_GAME_TABLE       = "nhl.gold.dim_game"
+DIM_DATE_TABLE       = "nhl.gold.dim_date"
+DIM_EVENT_TYPE_TABLE = "nhl.gold.dim_event_type"
+FACT_EVENT_TABLE     = "nhl.gold.fact_event"
+
+# Legacy tables from the previous, non-dimensional gold design — superseded by
+# the star schema below and fully reproducible, so we drop them for a clean layer.
+LEGACY_TABLES = [
+    "nhl.gold.player_stats",
+    "nhl.gold.team_stats",
+    "nhl.gold.dim_players",
+]
+
+# ----------------------------------------------------------------------
+# JSON schema for the bronze raw_json blob (only the fields we consume;
+# from_json silently ignores everything else). Localised NHL strings are
+# {"default": "..."} objects.
+# ----------------------------------------------------------------------
+_LOC = T.StructType([T.StructField("default", T.StringType())])
+
+_TEAM = T.StructType([
+    T.StructField("id",         T.IntegerType()),
+    T.StructField("abbrev",     T.StringType()),
+    T.StructField("commonName", _LOC),
+    T.StructField("placeName",  _LOC),
+    T.StructField("score",      T.IntegerType()),
+    T.StructField("sog",        T.IntegerType()),
+    T.StructField("logo",       T.StringType()),
+    T.StructField("darkLogo",   T.StringType()),
+])
+
+_ROSTER_SPOT = T.StructType([
+    T.StructField("teamId",        T.IntegerType()),
+    T.StructField("playerId",      T.LongType()),
+    T.StructField("firstName",     _LOC),
+    T.StructField("lastName",      _LOC),
+    T.StructField("sweaterNumber", T.IntegerType()),
+    T.StructField("positionCode",  T.StringType()),
+    T.StructField("headshot",      T.StringType()),
+])
+
+_PERIOD = T.StructType([
+    T.StructField("number",     T.IntegerType()),
+    T.StructField("periodType", T.StringType()),
+])
+
+_DETAILS = T.StructType([
+    T.StructField("xCoord",              T.IntegerType()),
+    T.StructField("yCoord",              T.IntegerType()),
+    T.StructField("zoneCode",            T.StringType()),
+    T.StructField("eventOwnerTeamId",    T.IntegerType()),
+    T.StructField("shotType",            T.StringType()),
+    # player-role ids
+    T.StructField("scoringPlayerId",     T.LongType()),
+    T.StructField("assist1PlayerId",     T.LongType()),
+    T.StructField("assist2PlayerId",     T.LongType()),
+    T.StructField("assist3PlayerId",     T.LongType()),
+    T.StructField("shootingPlayerId",    T.LongType()),
+    T.StructField("goalieInNetId",       T.LongType()),
+    T.StructField("hittingPlayerId",     T.LongType()),
+    T.StructField("hitteePlayerId",      T.LongType()),
+    T.StructField("blockingPlayerId",    T.LongType()),
+    T.StructField("winningPlayerId",     T.LongType()),
+    T.StructField("losingPlayerId",      T.LongType()),
+    T.StructField("committedByPlayerId", T.LongType()),
+    T.StructField("drawnByPlayerId",     T.LongType()),
+    T.StructField("servedByPlayerId",    T.LongType()),
+    T.StructField("playerId",            T.LongType()),
+    # running player/game totals
+    T.StructField("scoringPlayerTotal",  T.IntegerType()),
+    T.StructField("assist1PlayerTotal",  T.IntegerType()),
+    T.StructField("assist2PlayerTotal",  T.IntegerType()),
+    T.StructField("assist3PlayerTotal",  T.IntegerType()),
+    T.StructField("awayScore",           T.IntegerType()),
+    T.StructField("homeScore",           T.IntegerType()),
+    T.StructField("awaySOG",             T.IntegerType()),
+    T.StructField("homeSOG",             T.IntegerType()),
+    # penalties
+    T.StructField("typeCode",            T.StringType()),
+    T.StructField("descKey",             T.StringType()),
+    T.StructField("duration",            T.IntegerType()),
+    # stoppages
+    T.StructField("reason",              T.StringType()),
+    T.StructField("secondaryReason",     T.StringType()),
+])
+
+_PLAY = T.StructType([
+    T.StructField("eventId",               T.IntegerType()),
+    T.StructField("periodDescriptor",      _PERIOD),
+    T.StructField("timeInPeriod",          T.StringType()),
+    T.StructField("timeRemaining",         T.StringType()),
+    T.StructField("situationCode",         T.StringType()),
+    T.StructField("homeTeamDefendingSide", T.StringType()),
+    T.StructField("typeCode",              T.IntegerType()),
+    T.StructField("typeDescKey",           T.StringType()),
+    T.StructField("sortOrder",             T.IntegerType()),
+    T.StructField("details",               _DETAILS),
+])
+
+_GAME = T.StructType([
+    T.StructField("id",                T.LongType()),
+    T.StructField("season",            T.IntegerType()),
+    T.StructField("gameType",          T.IntegerType()),
+    T.StructField("gameDate",          T.StringType()),
+    T.StructField("startTimeUTC",      T.StringType()),
+    T.StructField("gameState",         T.StringType()),
+    T.StructField("gameScheduleState", T.StringType()),
+    T.StructField("limitedScoring",    T.BooleanType()),
+    T.StructField("regPeriods",        T.IntegerType()),
+    T.StructField("venue",             _LOC),
+    T.StructField("venueLocation",     _LOC),
+    T.StructField("gameOutcome",       T.StructType([T.StructField("lastPeriodType", T.StringType())])),
+    T.StructField("awayTeam",          _TEAM),
+    T.StructField("homeTeam",          _TEAM),
+    T.StructField("rosterSpots",       T.ArrayType(_ROSTER_SPOT)),
+    T.StructField("plays",             T.ArrayType(_PLAY)),
+])
 
 
 # ----------------------------------------------------------------------
-# Player stats
+# Parse bronze once → one canonical row per game
 # ----------------------------------------------------------------------
-def build_player_stats(silver):
+def load_canonical_games(spark):
     """
-    Returns a DataFrame with one row per (season, game_type, player_name).
-
-    Columns:
-      season, game_type, player_name,
-      games_played, goals, primary_assists, secondary_assists, assists, points,
-      shots_on_goal, shooting_pct,
-      hits, blocked_shots,
-      faceoff_wins, faceoff_losses, faceoff_pct,
-      penalty_minutes, giveaways, takeaways,
-      ingestion_timestamp
+    Parse every bronze JSON blob and return exactly one row per game_id
+    (the most recently ingested, in case a game was re-loaded), with a
+    derived DATE game_date and integer date_key (yyyymmdd).
     """
-    GC = ["season", "game_type"]
-
-    # ---- games_played ------------------------------------------------
-    player_name_cols = [
-        "scoring_player_name",
-        "assist1_player_name", "assist2_player_name", "assist3_player_name",
-        "shooting_player_name", "goalie_in_net_name",
-        "hitting_player_name", "hittee_player_name",
-        "blocking_player_name",
-        "winning_player_name", "losing_player_name",
-        "committed_by_player_name", "drawn_by_player_name", "served_by_player_name",
-        "player_name",
-    ]
-    appearances = None
-    for col_name in player_name_cols:
-        subset = (
-            silver.filter(F.col(col_name).isNotNull())
-            .select(*GC, "game_id", F.col(col_name).alias("pname"))
-        )
-        appearances = subset if appearances is None else appearances.union(subset)
-
-    games_played = (
-        appearances.distinct()
-        .groupBy(*GC, "pname")
-        .agg(F.countDistinct("game_id").alias("games_played"))
-        .withColumnRenamed("pname", "player_name")
+    parsed = (
+        spark.table(BRONZE_TABLE)
+        .select("ingestion_timestamp", F.from_json("raw_json", _GAME).alias("g"))
+        .select("ingestion_timestamp", "g.*")
+        .filter(F.col("id").isNotNull())
+        .withColumn("game_date", F.to_date("gameDate"))
+        .withColumn("date_key", F.date_format("game_date", "yyyyMMdd").cast("int"))
     )
 
-    # ---- goals -------------------------------------------------------
-    goals = (
-        silver.filter(F.col("type_desc_key") == "goal")
-        .filter(F.col("scoring_player_name").isNotNull())
-        .groupBy(*GC, F.col("scoring_player_name").alias("player_name"))
-        .agg(F.count("*").alias("goals"))
+    latest = Window.partitionBy("id").orderBy(F.col("ingestion_timestamp").desc_nulls_last())
+    return (
+        parsed
+        .withColumn("_rn", F.row_number().over(latest))
+        .filter(F.col("_rn") == 1)
+        .drop("_rn")
     )
 
-    # ---- primary assists ---------------------------------------------
-    primary_assists = (
-        silver.filter(F.col("type_desc_key") == "goal")
-        .filter(F.col("assist1_player_name").isNotNull())
-        .groupBy(*GC, F.col("assist1_player_name").alias("player_name"))
-        .agg(F.count("*").alias("primary_assists"))
-    )
 
-    # ---- secondary assists (assist2 + assist3 combined) --------------
-    secondary_assists = (
-        silver.filter(F.col("type_desc_key") == "goal")
-        .select(*GC, "assist2_player_name", "assist3_player_name")
+# ----------------------------------------------------------------------
+# Dimensions
+# ----------------------------------------------------------------------
+def build_dim_player(games):
+    """One row per player_id, with the most recently seen descriptive attributes."""
+    spots = (
+        games
+        .select("game_date", F.explode("rosterSpots").alias("s"))
         .select(
-            *GC,
-            F.explode(
-                F.array(F.col("assist2_player_name"), F.col("assist3_player_name"))
-            ).alias("player_name"),
+            F.col("game_date"),
+            F.col("s.playerId").alias("player_id"),
+            F.concat_ws(
+                " ",
+                F.col("s.firstName.default"),
+                F.col("s.lastName.default"),
+            ).alias("full_name"),
+            F.col("s.firstName.default").alias("first_name"),
+            F.col("s.lastName.default").alias("last_name"),
+            F.col("s.positionCode").alias("position_code"),
+            F.col("s.sweaterNumber").alias("sweater_number"),
+            F.col("s.teamId").alias("team_id"),
+            F.col("s.headshot").alias("headshot_url"),
         )
-        .filter(F.col("player_name").isNotNull())
-        .groupBy(*GC, "player_name")
-        .agg(F.count("*").alias("secondary_assists"))
+        .filter(F.col("player_id").isNotNull())
     )
 
-    # ---- shots on goal (goals count as shots) -----------------------
-    shots_on_goal = (
-        silver.filter(F.col("type_desc_key").isin("shot-on-goal", "goal"))
-        .filter(F.col("shooting_player_name").isNotNull())
-        .groupBy(*GC, F.col("shooting_player_name").alias("player_name"))
-        .agg(F.count("*").alias("shots_on_goal"))
+    bounds = spots.groupBy("player_id").agg(
+        F.min("game_date").alias("first_seen_date"),
+        F.max("game_date").alias("last_seen_date"),
     )
 
-    # ---- hits (the hitter, not the recipient) -----------------------
-    hits = (
-        silver.filter(F.col("type_desc_key") == "hit")
-        .filter(F.col("hitting_player_name").isNotNull())
-        .groupBy(*GC, F.col("hitting_player_name").alias("player_name"))
-        .agg(F.count("*").alias("hits"))
+    recent = Window.partitionBy("player_id").orderBy(F.col("game_date").desc_nulls_last())
+    most_recent = (
+        spots
+        .withColumn("_rn", F.row_number().over(recent))
+        .filter(F.col("_rn") == 1)
+        .drop("_rn", "game_date")
     )
-
-    # ---- blocked shots (the defender who blocked) ------------------
-    blocked_shots = (
-        silver.filter(F.col("type_desc_key") == "blocked-shot")
-        .filter(F.col("blocking_player_name").isNotNull())
-        .groupBy(*GC, F.col("blocking_player_name").alias("player_name"))
-        .agg(F.count("*").alias("blocked_shots"))
-    )
-
-    # ---- faceoffs ---------------------------------------------------
-    faceoff_wins = (
-        silver.filter(F.col("type_desc_key") == "faceoff")
-        .filter(F.col("winning_player_name").isNotNull())
-        .groupBy(*GC, F.col("winning_player_name").alias("player_name"))
-        .agg(F.count("*").alias("faceoff_wins"))
-    )
-
-    faceoff_losses = (
-        silver.filter(F.col("type_desc_key") == "faceoff")
-        .filter(F.col("losing_player_name").isNotNull())
-        .groupBy(*GC, F.col("losing_player_name").alias("player_name"))
-        .agg(F.count("*").alias("faceoff_losses"))
-    )
-
-    # ---- penalty minutes -------------------------------------------
-    pim = (
-        silver.filter(F.col("type_desc_key") == "penalty")
-        .filter(F.col("committed_by_player_name").isNotNull())
-        .filter(F.col("penalty_duration").isNotNull())
-        .groupBy(*GC, F.col("committed_by_player_name").alias("player_name"))
-        .agg(F.sum("penalty_duration").alias("penalty_minutes"))
-    )
-
-    # ---- giveaways & takeaways -------------------------------------
-    giveaways = (
-        silver.filter(F.col("type_desc_key") == "giveaway")
-        .filter(F.col("player_name").isNotNull())
-        .groupBy(*GC, "player_name")
-        .agg(F.count("*").alias("giveaways"))
-    )
-
-    takeaways = (
-        silver.filter(F.col("type_desc_key") == "takeaway")
-        .filter(F.col("player_name").isNotNull())
-        .groupBy(*GC, "player_name")
-        .agg(F.count("*").alias("takeaways"))
-    )
-
-    # ---- join & derive computed columns ----------------------------
-    z = F.lit(0).cast("bigint")
 
     return (
-        games_played
-        .join(goals,             [*GC, "player_name"], "left")
-        .join(primary_assists,   [*GC, "player_name"], "left")
-        .join(secondary_assists, [*GC, "player_name"], "left")
-        .join(shots_on_goal,     [*GC, "player_name"], "left")
-        .join(hits,              [*GC, "player_name"], "left")
-        .join(blocked_shots,     [*GC, "player_name"], "left")
-        .join(faceoff_wins,      [*GC, "player_name"], "left")
-        .join(faceoff_losses,    [*GC, "player_name"], "left")
-        .join(pim,               [*GC, "player_name"], "left")
-        .join(giveaways,         [*GC, "player_name"], "left")
-        .join(takeaways,         [*GC, "player_name"], "left")
-        .withColumn("goals",             F.coalesce("goals", z))
-        .withColumn("primary_assists",   F.coalesce("primary_assists", z))
-        .withColumn("secondary_assists", F.coalesce("secondary_assists", z))
-        .withColumn("assists",           F.col("primary_assists") + F.col("secondary_assists"))
-        .withColumn("points",            F.col("goals") + F.col("primary_assists") + F.col("secondary_assists"))
-        .withColumn("shots_on_goal",     F.coalesce("shots_on_goal", z))
-        .withColumn(
-            "shooting_pct",
-            F.when(
-                F.col("shots_on_goal") > 0,
-                F.round(F.col("goals").cast("double") / F.col("shots_on_goal") * 100, 2),
-            ),
-        )
-        .withColumn("hits",              F.coalesce("hits", z))
-        .withColumn("blocked_shots",     F.coalesce("blocked_shots", z))
-        .withColumn("faceoff_wins",      F.coalesce("faceoff_wins", z))
-        .withColumn("faceoff_losses",    F.coalesce("faceoff_losses", z))
-        .withColumn(
-            "faceoff_pct",
-            F.when(
-                F.col("faceoff_wins") + F.col("faceoff_losses") > 0,
-                F.round(
-                    F.col("faceoff_wins").cast("double")
-                    / (F.col("faceoff_wins") + F.col("faceoff_losses"))
-                    * 100,
-                    2,
-                ),
-            ),
-        )
-        .withColumn("penalty_minutes",   F.coalesce("penalty_minutes", z))
-        .withColumn("giveaways",         F.coalesce("giveaways", z))
-        .withColumn("takeaways",         F.coalesce("takeaways", z))
+        most_recent
+        .join(bounds, "player_id", "left")
         .withColumn("ingestion_timestamp", F.current_timestamp())
         .select(
-            "season", "game_type", "player_name",
-            "games_played",
-            "goals", "primary_assists", "secondary_assists", "assists", "points",
-            "shots_on_goal", "shooting_pct",
-            "hits", "blocked_shots",
-            "faceoff_wins", "faceoff_losses", "faceoff_pct",
-            "penalty_minutes", "giveaways", "takeaways",
-            "ingestion_timestamp",
+            "player_id", "full_name", "first_name", "last_name",
+            "position_code", "sweater_number", "team_id", "headshot_url",
+            "first_seen_date", "last_seen_date", "ingestion_timestamp",
         )
     )
 
 
-# ----------------------------------------------------------------------
-# Team stats
-# ----------------------------------------------------------------------
-def build_team_stats(silver):
-    """
-    Returns a DataFrame with one row per (season, game_type, team_id).
-
-    Columns:
-      season, game_type, team_id, team_abbrev, team_name,
-      games_played, wins, losses, ot_losses, standings_points, win_pct,
-      goals_for, goals_against, goal_differential,
-      shots_for, shots_against,
-      power_play_goals, short_handed_goals, penalty_minutes,
-      ingestion_timestamp
-    """
-    GC = ["season", "game_type"]
-
-    # ---- one row per game -------------------------------------------
-    # All plays in a game share the same game-context columns; pick one row
-    # per game_id to avoid double-counting in the aggregation below.
-    games = (
-        silver
-        .select(
-            *GC, "game_id",
-            "home_team_id", "home_team_abbrev", "home_team_name",
-            "away_team_id", "away_team_abbrev", "away_team_name",
-            "home_final_score", "away_final_score",
-            "home_final_sog",   "away_final_sog",
-            "last_period_type",
-        )
-        .dropDuplicates(["game_id"])
-        .filter(F.col("home_final_score").isNotNull())
-        .filter(F.col("away_final_score").isNotNull())
-    )
-
-    # ---- build home/away perspectives with win/loss flags -----------
-    def _team_game_rows(games, side):
-        """Return one row per game from the perspective of the given side ('home'/'away')."""
-        opp = "away" if side == "home" else "home"
-        scored_more = F.col(f"{side}_final_score") > F.col(f"{opp}_final_score")
-        scored_less  = F.col(f"{side}_final_score") < F.col(f"{opp}_final_score")
-        extra_time   = F.coalesce(F.col("last_period_type"), F.lit("REG")).isin("OT", "SO")
-
+def build_dim_team(games):
+    """One row per team_id, most recent descriptive attributes across home/away."""
+    def _side(side):
+        t = f"{side}Team"
         return games.select(
-            *GC, "game_id",
-            F.col(f"{side}_team_id").alias("team_id"),
-            F.col(f"{side}_team_abbrev").alias("team_abbrev"),
-            F.col(f"{side}_team_name").alias("team_name"),
-            F.col(f"{side}_final_score").alias("goals_for"),
-            F.col(f"{opp}_final_score").alias("goals_against"),
-            F.col(f"{side}_final_sog").alias("shots_for"),
-            F.col(f"{opp}_final_sog").alias("shots_against"),
-            F.when(scored_more, 1).otherwise(0).alias("win"),
-            F.when(scored_less &  extra_time, 1).otherwise(0).alias("ot_loss"),
-            F.when(scored_less & ~extra_time, 1).otherwise(0).alias("loss"),
+            F.col("game_date"),
+            F.col(f"{t}.id").alias("team_id"),
+            F.col(f"{t}.abbrev").alias("abbrev"),
+            F.col(f"{t}.commonName.default").alias("team_name"),
+            F.col(f"{t}.placeName.default").alias("place_name"),
+            F.col(f"{t}.logo").alias("logo_url"),
+            F.col(f"{t}.darkLogo").alias("dark_logo_url"),
         )
 
-    all_game_rows = _team_game_rows(games, "home").union(_team_game_rows(games, "away"))
+    teams = _side("home").union(_side("away")).filter(F.col("team_id").isNotNull())
 
-    base_stats = (
-        all_game_rows
-        .groupBy(*GC, "team_id", "team_abbrev", "team_name")
-        .agg(
-            F.count("game_id").alias("games_played"),
-            F.sum("win").alias("wins"),
-            F.sum("loss").alias("losses"),
-            F.sum("ot_loss").alias("ot_losses"),
-            F.sum("goals_for").alias("goals_for"),
-            F.sum("goals_against").alias("goals_against"),
-            F.sum(F.coalesce(F.col("shots_for"),   F.lit(0))).alias("shots_for"),
-            F.sum(F.coalesce(F.col("shots_against"), F.lit(0))).alias("shots_against"),
-        )
-    )
-
-    # ---- power-play and short-handed goals --------------------------
-    # situation_code layout: [away_goalie][away_skaters][home_skaters][home_goalie]
-    # PP goal = team scored while having more skaters on ice than the opponent.
-    # SH goal = team scored while having fewer skaters on ice.
-    goal_plays = (
-        silver
-        .filter(F.col("type_desc_key") == "goal")
-        .filter(F.col("situation_code").isNotNull())
-        .filter(F.length("situation_code") == 4)
-        .filter(F.col("event_owner_team_id").isNotNull())
-        .withColumn("away_sk", _SC_AWAY_SK)
-        .withColumn("home_sk", _SC_HOME_SK)
-    )
-
-    def _special_goals(goal_plays, side, skater_cond):
-        """Count goals for 'side' team (home/away) satisfying skater_cond (PP or SH)."""
-        opp = "away" if side == "home" else "home"
-        return (
-            goal_plays
-            .filter(F.col("event_owner_team_id") == F.col(f"{side}_team_id"))
-            .filter(skater_cond(side, opp))
-            .groupBy(*GC, F.col(f"{side}_team_id").alias("team_id"))
-            .agg(F.count("*").alias("goals"))
-        )
-
-    pp_cond = lambda s, o: F.col(f"{s}_sk") > F.col(f"{o}_sk")
-    sh_cond = lambda s, o: F.col(f"{s}_sk") < F.col(f"{o}_sk")
-
-    pp_goals = (
-        _special_goals(goal_plays, "home", pp_cond)
-        .union(_special_goals(goal_plays, "away", pp_cond))
-        .groupBy(*GC, "team_id")
-        .agg(F.sum("goals").alias("power_play_goals"))
-    )
-
-    sh_goals = (
-        _special_goals(goal_plays, "home", sh_cond)
-        .union(_special_goals(goal_plays, "away", sh_cond))
-        .groupBy(*GC, "team_id")
-        .agg(F.sum("goals").alias("short_handed_goals"))
-    )
-
-    # ---- penalty minutes per team -----------------------------------
-    team_pim = (
-        silver
-        .filter(F.col("type_desc_key") == "penalty")
-        .filter(F.col("event_owner_team_id").isNotNull())
-        .filter(F.col("penalty_duration").isNotNull())
-        .groupBy(*GC, F.col("event_owner_team_id").alias("team_id"))
-        .agg(F.sum("penalty_duration").alias("penalty_minutes"))
-    )
-
-    # ---- join & derive computed columns ----------------------------
-    z = F.lit(0).cast("bigint")
-
+    recent = Window.partitionBy("team_id").orderBy(F.col("game_date").desc_nulls_last())
     return (
-        base_stats
-        .join(pp_goals,  [*GC, "team_id"], "left")
-        .join(sh_goals,  [*GC, "team_id"], "left")
-        .join(team_pim,  [*GC, "team_id"], "left")
-        .withColumn("power_play_goals",   F.coalesce("power_play_goals",   z))
-        .withColumn("short_handed_goals", F.coalesce("short_handed_goals", z))
-        .withColumn("penalty_minutes",    F.coalesce("penalty_minutes",    z))
-        .withColumn("standings_points",   F.col("wins") * 2 + F.col("ot_losses"))
-        .withColumn("goal_differential",  F.col("goals_for") - F.col("goals_against"))
-        .withColumn(
-            "win_pct",
-            F.when(
-                F.col("games_played") > 0,
-                F.round(F.col("wins").cast("double") / F.col("games_played"), 4),
-            ),
-        )
+        teams
+        .withColumn("_rn", F.row_number().over(recent))
+        .filter(F.col("_rn") == 1)
+        .drop("_rn", "game_date")
         .withColumn("ingestion_timestamp", F.current_timestamp())
         .select(
-            "season", "game_type", "team_id", "team_abbrev", "team_name",
-            "games_played", "wins", "losses", "ot_losses",
-            "standings_points", "win_pct",
-            "goals_for", "goals_against", "goal_differential",
-            "shots_for", "shots_against",
-            "power_play_goals", "short_handed_goals", "penalty_minutes",
-            "ingestion_timestamp",
+            "team_id", "abbrev", "team_name", "place_name",
+            "logo_url", "dark_logo_url", "ingestion_timestamp",
+        )
+    )
+
+
+def build_dim_game(games):
+    """One row per game_id holding all game-level context."""
+    return (
+        games.select(
+            F.col("id").alias("game_id"),
+            F.col("season"),
+            F.col("gameType").alias("game_type"),
+            F.col("game_date"),
+            F.col("date_key"),
+            F.to_timestamp("startTimeUTC").alias("start_time_utc"),
+            F.col("venue.default").alias("venue"),
+            F.col("venueLocation.default").alias("venue_location"),
+            F.col("gameState").alias("game_state"),
+            F.col("gameScheduleState").alias("game_schedule_state"),
+            F.col("limitedScoring").alias("limited_scoring"),
+            F.col("regPeriods").alias("reg_periods"),
+            F.col("gameOutcome.lastPeriodType").alias("last_period_type"),
+            F.col("homeTeam.id").alias("home_team_id"),
+            F.col("awayTeam.id").alias("away_team_id"),
+            F.col("homeTeam.score").alias("home_final_score"),
+            F.col("awayTeam.score").alias("away_final_score"),
+            F.col("homeTeam.sog").alias("home_final_sog"),
+            F.col("awayTeam.sog").alias("away_final_sog"),
+            F.current_timestamp().alias("ingestion_timestamp"),
+        )
+    )
+
+
+def build_dim_date(games):
+    """Standard calendar dimension for every date present in the data."""
+    return (
+        games
+        .select("game_date")
+        .filter(F.col("game_date").isNotNull())
+        .distinct()
+        .withColumn("date_key", F.date_format("game_date", "yyyyMMdd").cast("int"))
+        .withColumn("year",         F.year("game_date"))
+        .withColumn("month",        F.month("game_date"))
+        .withColumn("day",          F.dayofmonth("game_date"))
+        .withColumn("quarter",      F.quarter("game_date"))
+        .withColumn("week_of_year", F.weekofyear("game_date"))
+        .withColumn("day_of_week",  F.dayofweek("game_date"))  # 1=Sun … 7=Sat
+        .withColumn("day_name",     F.date_format("game_date", "EEEE"))
+        .withColumn("month_name",   F.date_format("game_date", "MMMM"))
+        .withColumn("is_weekend",   F.dayofweek("game_date").isin(1, 7))
+        .withColumn("ingestion_timestamp", F.current_timestamp())
+        .select(
+            "date_key", F.col("game_date").alias("full_date"),
+            "year", "quarter", "month", "month_name",
+            "week_of_year", "day", "day_of_week", "day_name",
+            "is_weekend", "ingestion_timestamp",
         )
     )
 
 
 # ----------------------------------------------------------------------
-# Player dimension
+# Fact table (play grain) + the event-type dimension derived from it
 # ----------------------------------------------------------------------
-def build_dim_players(silver):
+def build_fact_event(games):
     """
-    Returns a DataFrame with one row per player_name.
-
-    player_id is a stable integer derived from hashing the player_name —
-    consistent across runs and used as the surrogate key for joins.
-
-    Columns: player_id, player_name, ingestion_timestamp
+    One row per play. Player-role columns carry the real NHL player_id and act
+    as role-playing foreign keys into dim_player; game_id → dim_game,
+    date_key → dim_date, type_code → dim_event_type, event_owner_team_id →
+    dim_team. (game_id, event_id) is the natural grain.
     """
-    player_name_cols = [
-        "scoring_player_name",
-        "assist1_player_name", "assist2_player_name", "assist3_player_name",
-        "shooting_player_name", "goalie_in_net_name",
-        "hitting_player_name", "hittee_player_name",
-        "blocking_player_name",
-        "winning_player_name", "losing_player_name",
-        "committed_by_player_name", "drawn_by_player_name", "served_by_player_name",
-        "player_name",
-    ]
-
-    all_names = None
-    for col_name in player_name_cols:
-        subset = silver.filter(F.col(col_name).isNotNull()).select(F.col(col_name).alias("player_name"))
-        all_names = subset if all_names is None else all_names.union(subset)
-
-    return (
-        all_names
-        .dropDuplicates(["player_name"])
-        .withColumn("player_id", F.abs(F.hash("player_name")))
-        .withColumn("ingestion_timestamp", F.current_timestamp())
-        .select("player_id", "player_name", "ingestion_timestamp")
+    exploded = games.select(
+        F.col("id").alias("game_id"),
+        F.col("date_key"),
+        F.explode("plays").alias("p"),
     )
+
+    d = F.col("p.details")
+    return (
+        exploded
+        .select(
+            # --- foreign keys ---
+            F.col("game_id"),
+            F.col("date_key"),
+            F.col("p.typeCode").alias("type_code"),
+            d.getField("eventOwnerTeamId").alias("event_owner_team_id"),
+            # --- player-role foreign keys (→ dim_player) ---
+            d.getField("scoringPlayerId").alias("scoring_player_id"),
+            d.getField("assist1PlayerId").alias("assist1_player_id"),
+            d.getField("assist2PlayerId").alias("assist2_player_id"),
+            d.getField("assist3PlayerId").alias("assist3_player_id"),
+            d.getField("shootingPlayerId").alias("shooting_player_id"),
+            d.getField("goalieInNetId").alias("goalie_in_net_id"),
+            d.getField("hittingPlayerId").alias("hitting_player_id"),
+            d.getField("hitteePlayerId").alias("hittee_player_id"),
+            d.getField("blockingPlayerId").alias("blocking_player_id"),
+            d.getField("winningPlayerId").alias("winning_player_id"),
+            d.getField("losingPlayerId").alias("losing_player_id"),
+            d.getField("committedByPlayerId").alias("committed_by_player_id"),
+            d.getField("drawnByPlayerId").alias("drawn_by_player_id"),
+            d.getField("servedByPlayerId").alias("served_by_player_id"),
+            d.getField("playerId").alias("player_id"),
+            # --- degenerate dimensions / play descriptors ---
+            F.col("p.eventId").alias("event_id"),
+            F.col("p.sortOrder").alias("sort_order"),
+            F.col("p.typeDescKey").alias("type_desc_key"),
+            F.col("p.periodDescriptor.number").alias("period_number"),
+            F.col("p.periodDescriptor.periodType").alias("period_type"),
+            F.col("p.timeInPeriod").alias("time_in_period"),
+            F.col("p.timeRemaining").alias("time_remaining"),
+            F.col("p.situationCode").alias("situation_code"),
+            F.col("p.homeTeamDefendingSide").alias("home_team_defending_side"),
+            d.getField("xCoord").alias("x_coord"),
+            d.getField("yCoord").alias("y_coord"),
+            d.getField("zoneCode").alias("zone_code"),
+            d.getField("shotType").alias("shot_type"),
+            # --- measures ---
+            d.getField("scoringPlayerTotal").alias("scoring_player_total"),
+            d.getField("assist1PlayerTotal").alias("assist1_player_total"),
+            d.getField("assist2PlayerTotal").alias("assist2_player_total"),
+            d.getField("assist3PlayerTotal").alias("assist3_player_total"),
+            d.getField("awayScore").alias("away_score"),
+            d.getField("homeScore").alias("home_score"),
+            d.getField("awaySOG").alias("away_sog"),
+            d.getField("homeSOG").alias("home_sog"),
+            d.getField("typeCode").alias("penalty_type_code"),
+            d.getField("descKey").alias("penalty_desc_key"),
+            d.getField("duration").alias("penalty_duration"),
+            d.getField("reason").alias("stoppage_reason"),
+            d.getField("secondaryReason").alias("secondary_stoppage_reason"),
+        )
+        .filter(F.col("event_id").isNotNull())
+        .withColumn("ingestion_timestamp", F.current_timestamp())
+    )
+
+
+def build_dim_event_type(fact_event):
+    """One row per event type_code, derived from the fact table."""
+    recent = Window.partitionBy("type_code").orderBy(F.col("type_desc_key").asc_nulls_last())
+    return (
+        fact_event
+        .select("type_code", "type_desc_key")
+        .filter(F.col("type_code").isNotNull())
+        .withColumn("_rn", F.row_number().over(recent))
+        .filter(F.col("_rn") == 1)
+        .drop("_rn")
+        .withColumn("ingestion_timestamp", F.current_timestamp())
+        .select("type_code", "type_desc_key", "ingestion_timestamp")
+    )
+
+
+# ----------------------------------------------------------------------
+# Write helper
+# ----------------------------------------------------------------------
+def overwrite_table(df, table):
+    (
+        df.write
+        .format("delta")
+        .mode("overwrite")
+        .option("overwriteSchema", "true")
+        .saveAsTable(table)
+    )
+    logger.info(f"Written: {table}")
 
 
 # ----------------------------------------------------------------------
@@ -451,36 +455,34 @@ def build_dim_players(silver):
 spark.sql("CREATE SCHEMA IF NOT EXISTS nhl.gold")
 logger.info("Gold schema ready.")
 
-silver = spark.table(SILVER_TABLE)
+for legacy in LEGACY_TABLES:
+    spark.sql(f"DROP TABLE IF EXISTS {legacy}")
+    logger.info(f"Dropped legacy table (superseded by star schema): {legacy}")
 
-logger.info("Building player stats…")
-(
-    build_player_stats(silver).write
-    .format("delta")
-    .mode("overwrite")
-    .option("overwriteSchema", "true")
-    .saveAsTable(PLAYER_STATS_TABLE)
-)
-logger.info(f"Written: {PLAYER_STATS_TABLE}")
+games = load_canonical_games(spark).cache()
+logger.info(f"Canonical games parsed: {games.count()}")
 
-logger.info("Building team stats…")
-(
-    build_team_stats(silver).write
-    .format("delta")
-    .mode("overwrite")
-    .option("overwriteSchema", "true")
-    .saveAsTable(TEAM_STATS_TABLE)
-)
-logger.info(f"Written: {TEAM_STATS_TABLE}")
+logger.info("Building dim_player…")
+overwrite_table(build_dim_player(games), DIM_PLAYER_TABLE)
 
-logger.info("Building player dimension…")
-(
-    build_dim_players(silver).write
-    .format("delta")
-    .mode("overwrite")
-    .option("overwriteSchema", "true")
-    .saveAsTable(DIM_PLAYERS_TABLE)
-)
-logger.info(f"Written: {DIM_PLAYERS_TABLE}")
+logger.info("Building dim_team…")
+overwrite_table(build_dim_team(games), DIM_TEAM_TABLE)
+
+logger.info("Building dim_game…")
+overwrite_table(build_dim_game(games), DIM_GAME_TABLE)
+
+logger.info("Building dim_date…")
+overwrite_table(build_dim_date(games), DIM_DATE_TABLE)
+
+logger.info("Building fact_event…")
+fact_event = build_fact_event(games).cache()
+overwrite_table(fact_event, FACT_EVENT_TABLE)
+logger.info(f"fact_event rows: {fact_event.count()}")
+
+logger.info("Building dim_event_type…")
+overwrite_table(build_dim_event_type(fact_event), DIM_EVENT_TYPE_TABLE)
+
+fact_event.unpersist()
+games.unpersist()
 
 logger.info("batch_gold complete.")
