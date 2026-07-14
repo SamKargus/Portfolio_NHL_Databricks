@@ -68,6 +68,10 @@ DIM_DATE_TABLE       = "nhl.gold.dim_date"
 DIM_EVENT_TYPE_TABLE = "nhl.gold.dim_event_type"
 FACT_EVENT_TABLE     = "nhl.gold.fact_event"
 
+# Transient: holds the parsed-once canonical games so serverless compute (no
+# cache/persist) still parses the bronze JSON only once. Dropped at the end.
+STAGING_GAMES_TABLE  = "nhl.gold.staging_canonical_games"
+
 # Legacy tables from the previous, non-dimensional gold design — superseded by
 # the star schema below and fully reproducible, so we drop them for a clean layer.
 LEGACY_TABLES = [
@@ -459,7 +463,11 @@ for legacy in LEGACY_TABLES:
     spark.sql(f"DROP TABLE IF EXISTS {legacy}")
     logger.info(f"Dropped legacy table (superseded by star schema): {legacy}")
 
-games = load_canonical_games(spark).cache()
+# Serverless compute does not support cache()/persist(), so we materialise the
+# parsed-once canonical games to a staging Delta table and read it back for every
+# downstream build — this parses the bronze JSON a single time.
+overwrite_table(load_canonical_games(spark), STAGING_GAMES_TABLE)
+games = spark.table(STAGING_GAMES_TABLE)
 logger.info(f"Canonical games parsed: {games.count()}")
 
 logger.info("Building dim_player…")
@@ -475,14 +483,14 @@ logger.info("Building dim_date…")
 overwrite_table(build_dim_date(games), DIM_DATE_TABLE)
 
 logger.info("Building fact_event…")
-fact_event = build_fact_event(games).cache()
-overwrite_table(fact_event, FACT_EVENT_TABLE)
+overwrite_table(build_fact_event(games), FACT_EVENT_TABLE)
+fact_event = spark.table(FACT_EVENT_TABLE)  # read back the persisted fact
 logger.info(f"fact_event rows: {fact_event.count()}")
 
 logger.info("Building dim_event_type…")
 overwrite_table(build_dim_event_type(fact_event), DIM_EVENT_TYPE_TABLE)
 
-fact_event.unpersist()
-games.unpersist()
+spark.sql(f"DROP TABLE IF EXISTS {STAGING_GAMES_TABLE}")
+logger.info("Dropped staging table.")
 
 logger.info("batch_gold complete.")
