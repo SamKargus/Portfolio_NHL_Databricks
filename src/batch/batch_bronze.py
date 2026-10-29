@@ -28,6 +28,11 @@ logger.info(f"batch_bronze started — log: {log_file}")
 
 BASE_URL = "https://api-web.nhle.com/v1"
 
+# Bronze is game grain: a game is only loaded once it's over. Anything else
+# (FUT, PRE, LIVE, CRIT) would be stored half-finished and, because existing
+# URLs are skipped, never refreshed. Live games are handled by the live pipeline.
+FINAL_STATES = {"OFF", "FINAL"}
+
 # Ensure the target Delta table exists
 spark.sql("""
     CREATE TABLE IF NOT EXISTS nhl.bronze.nhl_events (
@@ -59,6 +64,12 @@ def process_game(game_id: str) -> bool:
         data = response.json()
         logger.info(f"Request succeeded — {len(response.content)} bytes received")
 
+        # Safety net: the schedule said final, but don't trust it blindly
+        game_state = data.get("gameState")
+        if game_state not in FINAL_STATES:
+            logger.info(f"Skipping game {game_id}: gameState={game_state} (not final yet)")
+            return False
+
         raw_json_str = json.dumps(data)
 
         row = Row(
@@ -84,7 +95,11 @@ def process_game(game_id: str) -> bool:
 # Helpers to discover game IDs
 # ----------------------------------------------------------------------
 def get_game_ids_for_day(d: date) -> list:
-    """Return list of game ID strings for a single day."""
+    """
+    Return game ID strings for finished games in the gameWeek starting at d.
+    The schedule endpoint returns 7 days from d, so near today it includes
+    future games — those are filtered out by FINAL_STATES.
+    """
     url = f"{BASE_URL}/schedule/{d.isoformat()}"
     for attempt in range(1, 6):
         try:
@@ -95,6 +110,7 @@ def get_game_ids_for_day(d: date) -> list:
                     str(game["id"])
                     for gw in data.get("gameWeek", [])
                     for game in gw.get("games", [])
+                    if game.get("gameState") in FINAL_STATES
                 ]
             elif resp.status_code == 429:
                 wait = 2 ** attempt
