@@ -1,14 +1,17 @@
 """
 Gold layer — a Kimball-style star schema over NHL play-by-play data.
 
-Silver (nhl.silver.nhl_plays) is intentionally left un-modelled: it is a flat,
-denormalised, name-only view of every play. Gold is where the dimensional model
-lives. Because silver deliberately carries player *names* but no player *ids*,
-this layer is built directly from the bronze JSON (nhl.bronze.nhl_events), which
-is the only place that still holds real NHL player ids (in each play's `details`
-and in `rosterSpots`). Linking facts to players by name would re-introduce the
-duplicate-name collisions the id-based model exists to avoid, so gold re-parses
-bronze rather than reading silver.
+Silver (nhl.silver.nhl_plays) is a flat, denormalised table of every play,
+written by both the nightly batch and the live pipeline. Gold is where the
+dimensional model lives.
+
+  * fact_event is a VIEW over silver, so plays from games in progress show up
+    in gold the moment the live pipeline merges them, alongside the history.
+    Silver carries the real NHL player ids for every role, so the fact links to
+    players by id — never by name, which would collide on duplicate names
+    (e.g. two "Sebastian Aho").
+  * The dimensions are rebuilt from the bronze JSON (nhl.bronze.nhl_events),
+    which holds attributes silver doesn't (rosterSpots, logos, place names).
 
 Grain & paradigm
 ----------------
@@ -22,15 +25,17 @@ and collision-free.
         dim_game ─┘                 ├─ dim_player  (role-playing)
    dim_event_type ─────────────────┘
 
-Tables produced (all fully overwritten each run — idempotent, safe to re-run):
+Objects produced (tables fully overwritten each run — idempotent, safe to re-run):
   nhl.gold.dim_player      one row per player_id (Type 1 — current attributes)
   nhl.gold.dim_player_team player↔team stint history (trades) with valid_from/
                            valid_to/is_current — the slowly-changing part
   nhl.gold.dim_team        one row per team_id
   nhl.gold.dim_game        one row per game_id
-  nhl.gold.dim_date        one row per calendar date present in the data
+  nhl.gold.dim_date        one row per calendar day, 1917-01-01 to the end of
+                           next year (so live games always have a date row)
   nhl.gold.dim_event_type  one row per event type_code
-  nhl.gold.fact_event      one row per play; real player-id FK per role
+  nhl.gold.fact_event      VIEW over silver — one row per play, real player-id
+                           FK per role, plus source/is_final lineage
 
 The parsing is fully distributed (from_json + explode) — no driver-side JSON
 work, so there is no OOM risk regardless of game count.
@@ -62,6 +67,7 @@ logger = logging.getLogger("batch_gold")
 logger.info(f"batch_gold started — log: {log_file}")
 
 BRONZE_TABLE = "nhl.bronze.nhl_events"
+SILVER_TABLE = "nhl.silver.nhl_plays"
 
 DIM_PLAYER_TABLE     = "nhl.gold.dim_player"
 DIM_PLAYER_TEAM_TABLE = "nhl.gold.dim_player_team"
@@ -84,9 +90,9 @@ LEGACY_TABLES = [
 ]
 
 # ----------------------------------------------------------------------
-# JSON schema for the bronze raw_json blob (only the fields we consume;
-# from_json silently ignores everything else). Localised NHL strings are
-# {"default": "..."} objects.
+# JSON schema for the bronze raw_json blob — only the game-level fields the
+# dimensions consume (from_json silently ignores everything else). Localised
+# NHL strings are {"default": "..."} objects.
 # ----------------------------------------------------------------------
 _LOC = T.StructType([T.StructField("default", T.StringType())])
 
@@ -111,64 +117,6 @@ _ROSTER_SPOT = T.StructType([
     T.StructField("headshot",      T.StringType()),
 ])
 
-_PERIOD = T.StructType([
-    T.StructField("number",     T.IntegerType()),
-    T.StructField("periodType", T.StringType()),
-])
-
-_DETAILS = T.StructType([
-    T.StructField("xCoord",              T.IntegerType()),
-    T.StructField("yCoord",              T.IntegerType()),
-    T.StructField("zoneCode",            T.StringType()),
-    T.StructField("eventOwnerTeamId",    T.IntegerType()),
-    T.StructField("shotType",            T.StringType()),
-    # player-role ids
-    T.StructField("scoringPlayerId",     T.LongType()),
-    T.StructField("assist1PlayerId",     T.LongType()),
-    T.StructField("assist2PlayerId",     T.LongType()),
-    T.StructField("assist3PlayerId",     T.LongType()),
-    T.StructField("shootingPlayerId",    T.LongType()),
-    T.StructField("goalieInNetId",       T.LongType()),
-    T.StructField("hittingPlayerId",     T.LongType()),
-    T.StructField("hitteePlayerId",      T.LongType()),
-    T.StructField("blockingPlayerId",    T.LongType()),
-    T.StructField("winningPlayerId",     T.LongType()),
-    T.StructField("losingPlayerId",      T.LongType()),
-    T.StructField("committedByPlayerId", T.LongType()),
-    T.StructField("drawnByPlayerId",     T.LongType()),
-    T.StructField("servedByPlayerId",    T.LongType()),
-    T.StructField("playerId",            T.LongType()),
-    # running player/game totals
-    T.StructField("scoringPlayerTotal",  T.IntegerType()),
-    T.StructField("assist1PlayerTotal",  T.IntegerType()),
-    T.StructField("assist2PlayerTotal",  T.IntegerType()),
-    T.StructField("assist3PlayerTotal",  T.IntegerType()),
-    T.StructField("awayScore",           T.IntegerType()),
-    T.StructField("homeScore",           T.IntegerType()),
-    T.StructField("awaySOG",             T.IntegerType()),
-    T.StructField("homeSOG",             T.IntegerType()),
-    # penalties
-    T.StructField("typeCode",            T.StringType()),
-    T.StructField("descKey",             T.StringType()),
-    T.StructField("duration",            T.IntegerType()),
-    # stoppages
-    T.StructField("reason",              T.StringType()),
-    T.StructField("secondaryReason",     T.StringType()),
-])
-
-_PLAY = T.StructType([
-    T.StructField("eventId",               T.IntegerType()),
-    T.StructField("periodDescriptor",      _PERIOD),
-    T.StructField("timeInPeriod",          T.StringType()),
-    T.StructField("timeRemaining",         T.StringType()),
-    T.StructField("situationCode",         T.StringType()),
-    T.StructField("homeTeamDefendingSide", T.StringType()),
-    T.StructField("typeCode",              T.IntegerType()),
-    T.StructField("typeDescKey",           T.StringType()),
-    T.StructField("sortOrder",             T.IntegerType()),
-    T.StructField("details",               _DETAILS),
-])
-
 _GAME = T.StructType([
     T.StructField("id",                T.LongType()),
     T.StructField("season",            T.IntegerType()),
@@ -185,7 +133,7 @@ _GAME = T.StructType([
     T.StructField("awayTeam",          _TEAM),
     T.StructField("homeTeam",          _TEAM),
     T.StructField("rosterSpots",       T.ArrayType(_ROSTER_SPOT)),
-    T.StructField("plays",             T.ArrayType(_PLAY)),
+    # plays are not parsed here — fact_event reads them from silver
 ])
 
 
@@ -397,13 +345,17 @@ def build_dim_game(games):
     )
 
 
-def build_dim_date(games):
-    """Standard calendar dimension for every date present in the data."""
+def build_dim_date(spark):
+    """
+    Standard calendar dimension: every day from the first NHL season to the end
+    of next year. Generated rather than derived from games, so tonight's live
+    games (not in bronze until they're final) still join to a date row.
+    """
     return (
-        games
-        .select("game_date")
-        .filter(F.col("game_date").isNotNull())
-        .distinct()
+        spark.range(1)
+        .select(F.expr(
+            "explode(sequence(DATE'1917-01-01', make_date(year(current_date()) + 1, 12, 31), INTERVAL 1 DAY))"
+        ).alias("game_date"))
         .withColumn("date_key", F.date_format("game_date", "yyyyMMdd").cast("int"))
         .withColumn("year",         F.year("game_date"))
         .withColumn("month",        F.month("game_date"))
@@ -425,78 +377,89 @@ def build_dim_date(games):
 
 
 # ----------------------------------------------------------------------
-# Fact table (play grain) + the event-type dimension derived from it
+# Fact view (play grain, over silver) + the event-type dimension derived from it
 # ----------------------------------------------------------------------
-def build_fact_event(games):
+def create_fact_event_view(spark):
     """
-    One row per play. Player-role columns carry the real NHL player_id and act
-    as role-playing foreign keys into dim_player; game_id → dim_game,
+    One row per play, as a view over silver — batch history and live games in
+    one place. Player-role columns carry the real NHL player_id and act as
+    role-playing foreign keys into dim_player; game_id → dim_game,
     date_key → dim_date, type_code → dim_event_type, event_owner_team_id →
     dim_team. (game_id, event_id) is the natural grain.
-    """
-    exploded = games.select(
-        F.col("id").alias("game_id"),
-        F.col("date_key"),
-        F.explode("plays").alias("p"),
-    )
 
-    d = F.col("p.details")
-    return (
-        exploded
-        .select(
-            # --- foreign keys ---
-            F.col("game_id"),
-            F.col("date_key"),
-            F.col("p.typeCode").alias("type_code"),
-            d.getField("eventOwnerTeamId").alias("event_owner_team_id"),
-            # --- player-role foreign keys (→ dim_player) ---
-            d.getField("scoringPlayerId").alias("scoring_player_id"),
-            d.getField("assist1PlayerId").alias("assist1_player_id"),
-            d.getField("assist2PlayerId").alias("assist2_player_id"),
-            d.getField("assist3PlayerId").alias("assist3_player_id"),
-            d.getField("shootingPlayerId").alias("shooting_player_id"),
-            d.getField("goalieInNetId").alias("goalie_in_net_id"),
-            d.getField("hittingPlayerId").alias("hitting_player_id"),
-            d.getField("hitteePlayerId").alias("hittee_player_id"),
-            d.getField("blockingPlayerId").alias("blocking_player_id"),
-            d.getField("winningPlayerId").alias("winning_player_id"),
-            d.getField("losingPlayerId").alias("losing_player_id"),
-            d.getField("committedByPlayerId").alias("committed_by_player_id"),
-            d.getField("drawnByPlayerId").alias("drawn_by_player_id"),
-            d.getField("servedByPlayerId").alias("served_by_player_id"),
-            d.getField("playerId").alias("player_id"),
-            # --- degenerate dimensions / play descriptors ---
-            F.col("p.eventId").alias("event_id"),
-            F.col("p.sortOrder").alias("sort_order"),
-            F.col("p.typeDescKey").alias("type_desc_key"),
-            F.col("p.periodDescriptor.number").alias("period_number"),
-            F.col("p.periodDescriptor.periodType").alias("period_type"),
-            F.col("p.timeInPeriod").alias("time_in_period"),
-            F.col("p.timeRemaining").alias("time_remaining"),
-            F.col("p.situationCode").alias("situation_code"),
-            F.col("p.homeTeamDefendingSide").alias("home_team_defending_side"),
-            d.getField("xCoord").alias("x_coord"),
-            d.getField("yCoord").alias("y_coord"),
-            d.getField("zoneCode").alias("zone_code"),
-            d.getField("shotType").alias("shot_type"),
-            # --- measures ---
-            d.getField("scoringPlayerTotal").alias("scoring_player_total"),
-            d.getField("assist1PlayerTotal").alias("assist1_player_total"),
-            d.getField("assist2PlayerTotal").alias("assist2_player_total"),
-            d.getField("assist3PlayerTotal").alias("assist3_player_total"),
-            d.getField("awayScore").alias("away_score"),
-            d.getField("homeScore").alias("home_score"),
-            d.getField("awaySOG").alias("away_sog"),
-            d.getField("homeSOG").alias("home_sog"),
-            d.getField("typeCode").alias("penalty_type_code"),
-            d.getField("descKey").alias("penalty_desc_key"),
-            d.getField("duration").alias("penalty_duration"),
-            d.getField("reason").alias("stoppage_reason"),
-            d.getField("secondaryReason").alias("secondary_stoppage_reason"),
-        )
-        .filter(F.col("event_id").isNotNull())
-        .withColumn("ingestion_timestamp", F.current_timestamp())
-    )
+    Lineage: source = 'batch' (final, from bronze) or 'live' (game in progress);
+    is_final says whether the game was over when the row was written.
+    """
+    # fact_event used to be a table, and a view can't replace a table in place.
+    existing = spark.sql("""
+        SELECT table_type FROM nhl.information_schema.tables
+        WHERE table_schema = 'gold' AND table_name = 'fact_event'
+    """).collect()
+    if existing and existing[0].table_type != "VIEW":
+        spark.sql(f"DROP TABLE {FACT_EVENT_TABLE}")
+        logger.info(f"Dropped old {FACT_EVENT_TABLE} table (replaced by a view over silver)")
+
+    spark.sql(f"""
+        CREATE OR REPLACE VIEW {FACT_EVENT_TABLE}
+        COMMENT 'One row per play (game_id, event_id) — batch history + live games, over {SILVER_TABLE}'
+        AS SELECT
+            -- foreign keys
+            game_id,
+            CAST(date_format(game_date, 'yyyyMMdd') AS INT) AS date_key,
+            type_code,
+            event_owner_team_id,
+            -- player-role foreign keys (→ dim_player)
+            scoring_player_id,
+            assist1_player_id,
+            assist2_player_id,
+            assist3_player_id,
+            shooting_player_id,
+            goalie_in_net_id,
+            hitting_player_id,
+            hittee_player_id,
+            blocking_player_id,
+            winning_player_id,
+            losing_player_id,
+            committed_by_player_id,
+            drawn_by_player_id,
+            served_by_player_id,
+            player_id,
+            -- degenerate dimensions / play descriptors
+            event_id,
+            sort_order,
+            type_desc_key,
+            period_number,
+            period_type,
+            time_in_period,
+            time_remaining,
+            situation_code,
+            home_team_defending_side,
+            x_coord,
+            y_coord,
+            zone_code,
+            shot_type,
+            -- measures
+            scoring_player_total,
+            assist1_player_total,
+            assist2_player_total,
+            assist3_player_total,
+            away_score,
+            home_score,
+            away_sog,
+            home_sog,
+            penalty_type_code,
+            penalty_desc_key,
+            penalty_duration,
+            stoppage_reason,
+            secondary_stoppage_reason,
+            -- lineage
+            source,
+            is_final,
+            fetched_at,
+            ingestion_timestamp
+        FROM {SILVER_TABLE}
+        WHERE event_id IS NOT NULL
+    """)
 
 
 def build_dim_event_type(fact_event):
@@ -558,12 +521,11 @@ logger.info("Building dim_game…")
 overwrite_table(build_dim_game(games), DIM_GAME_TABLE)
 
 logger.info("Building dim_date…")
-overwrite_table(build_dim_date(games), DIM_DATE_TABLE)
+overwrite_table(build_dim_date(spark), DIM_DATE_TABLE)
 
-logger.info("Building fact_event…")
-overwrite_table(build_fact_event(games), FACT_EVENT_TABLE)
-fact_event = spark.table(FACT_EVENT_TABLE)  # read back the persisted fact
-logger.info(f"fact_event rows: {fact_event.count()}")
+logger.info("Creating fact_event view over silver…")
+create_fact_event_view(spark)
+fact_event = spark.table(FACT_EVENT_TABLE)
 
 logger.info("Building dim_event_type…")
 overwrite_table(build_dim_event_type(fact_event), DIM_EVENT_TYPE_TABLE)
