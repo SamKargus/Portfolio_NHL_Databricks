@@ -14,16 +14,23 @@
 # MAGIC | D | all plays, `OFF` | game goes final, removed play comes back |
 # MAGIC
 # MAGIC **Run order**
-# MAGIC 1. Run cells 1–3 (setup + step A files).
+# MAGIC 1. Run SETUP 1, SETUP 2, then STEP A — write.
 # MAGIC 2. Create the pipeline: source = `foreach_sink_test_pipeline.py`, catalog `nhl`, schema `scratch`,
 # MAGIC    serverless, **Continuous** mode. Start it. If Continuous is refused, switch to Triggered and
 # MAGIC    click *Start* after writing each step's files instead — and note that it was refused.
-# MAGIC 3. Run each step's "write" cell, then its "check" cell.
+# MAGIC 3. Run STEP A — check, then each later step's "write" cell followed by its "check" cell.
 # MAGIC 4. Teardown cell at the bottom when finished.
+# MAGIC
+# MAGIC **If you get a `NameError`** (serverless notebooks drop Python state when idle), re-run
+# MAGIC **SETUP 2 only** — it just fetches the game and defines helpers. Do *not* re-run SETUP 1
+# MAGIC (recreates the target empty) or any write cell (adds an extra snapshot and breaks the counts).
+# MAGIC
+# MAGIC **To start over:** stop the pipeline → RESET → SETUP 1 → SETUP 2 → STEP A — write →
+# MAGIC pipeline *Full refresh all* → STEP A — check.
 
 # COMMAND ----------
 
-# 1. Config + scratch objects
+# SETUP 1 — config + scratch objects (empties the target table — run once)
 import json
 import os
 import time
@@ -74,7 +81,7 @@ print("Scratch schema, volume and target table ready.")
 
 # COMMAND ----------
 
-# 2. Fetch the real game and define the snapshot writer
+# SETUP 2 — fetch the game + define helpers (safe to re-run any time)
 resp = requests.get(f"https://api-web.nhle.com/v1/gamecenter/{TEST_GAME_ID}/play-by-play", timeout=30)
 resp.raise_for_status()
 FULL_GAME = resp.json()
@@ -136,12 +143,12 @@ print(f"Will correct eventId={CORRECTED_EVENT_ID} and remove eventId={REMOVED_EV
 
 # COMMAND ----------
 
-# 3. Step A — write: first 100 plays, LIVE  (then create + start the pipeline)
+# STEP A — write: first 100 plays, LIVE  (then create + start the pipeline)
 write_snapshot(TEST_GAME_ID, ALL_PLAYS[:100], "LIVE", now_utc())
 
 # COMMAND ----------
 
-# 3. Step A — check
+# STEP A — check
 wait_for_raw_rows(1)
 assert test_game().count() == 100, f"expected 100 plays, got {test_game().count()}"
 assert test_game().filter("source = 'live' AND NOT is_final").count() == 100
@@ -150,7 +157,7 @@ print("Step A passed ✔  Auto Loader + foreach_batch_sink MERGE insert work")
 
 # COMMAND ----------
 
-# 4. Step B — write: first 200 plays, one shot-type corrected, one play removed
+# STEP B — write: first 200 plays, one shot-type corrected, one play removed
 plays_b = [json.loads(json.dumps(p)) for p in ALL_PLAYS[:200]]   # deep copy
 plays_b[CORRECTED_IDX]["details"]["shotType"] = "corrected-in-test"
 del plays_b[REMOVED_IDX]
@@ -159,7 +166,7 @@ write_snapshot(TEST_GAME_ID, plays_b, "LIVE", SNAP_B_TIME)
 
 # COMMAND ----------
 
-# 4. Step B — check
+# STEP B — check
 wait_for_raw_rows(2)
 assert test_game().count() == 199, f"expected 199 plays, got {test_game().count()}"
 assert test_game().filter(f"event_id = {CORRECTED_EVENT_ID}").first().shot_type == "corrected-in-test", "update did not apply"
@@ -169,13 +176,13 @@ print("Step B passed ✔  updates and game-scoped deletes work")
 
 # COMMAND ----------
 
-# 5. Step C — write: a late (older) snapshot, and a live snapshot for a batch-owned game
+# STEP C — write: a late (older) snapshot, and a live snapshot for a batch-owned game
 write_snapshot(TEST_GAME_ID, ALL_PLAYS[:20], "LIVE", SNAP_B_TIME - timedelta(minutes=5))
 write_snapshot(BATCH_GAME_ID, ALL_PLAYS[:3], "LIVE", now_utc())
 
 # COMMAND ----------
 
-# 5. Step C — check (nothing in the target should change)
+# STEP C — check (nothing in the target should change)
 wait_for_raw_rows(4)
 assert test_game().count() == 199, f"late snapshot was applied: {test_game().count()} plays"
 assert test_game().filter(f"event_id = {CORRECTED_EVENT_ID}").first().shot_type == "corrected-in-test"
@@ -184,12 +191,12 @@ print("Step C passed ✔  late files and batch-owned games are ignored")
 
 # COMMAND ----------
 
-# 6. Step D — write: the full game, OFF
+# STEP D — write: the full game, OFF
 write_snapshot(TEST_GAME_ID, ALL_PLAYS, "OFF", now_utc())
 
 # COMMAND ----------
 
-# 6. Step D — check
+# STEP D — check
 wait_for_raw_rows(5)
 n = len(ALL_PLAYS)
 assert test_game().count() == n, f"expected {n} plays, got {test_game().count()}"
@@ -203,6 +210,17 @@ got_play_rows = spark.table(PLAYS_TABLE).count()
 assert got_play_rows == expected_play_rows, f"{PLAYS_TABLE}: expected {expected_play_rows}, got {got_play_rows}"
 print(f"Step D passed ✔  final snapshot applied; {PLAYS_TABLE} kept all {got_play_rows} play versions")
 print("\nALL STEPS PASSED")
+
+# COMMAND ----------
+
+# RESET — only to start the test over. Stop the pipeline first; afterwards run SETUP 1, SETUP 2,
+# STEP A — write, then Full refresh the pipeline.
+import os, shutil
+
+landing = "/Volumes/nhl/scratch/pbp_landing"
+for entry in os.listdir(landing):
+    shutil.rmtree(os.path.join(landing, entry))
+print(f"Cleared {landing}")
 
 # COMMAND ----------
 
