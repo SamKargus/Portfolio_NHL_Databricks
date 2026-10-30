@@ -33,6 +33,23 @@ BASE_URL = "https://api-web.nhle.com/v1"
 # URLs are skipped, never refreshed. Live games are handled by the live pipeline.
 FINAL_STATES = {"OFF", "FINAL"}
 
+# One Delta commit per FLUSH_EVERY games instead of one per game. Each commit
+# costs about a second on serverless, which used to be most of the run time.
+# Raw JSON is up to a few hundred KB per game, so keep this modest.
+FLUSH_EVERY = 100
+MAX_FLUSH_RETRIES = 5
+FLUSH_RETRY_BASE_DELAY = 30  # seconds; doubles each attempt (30, 60, 120, 240)
+
+# Pause after every play-by-play request. The per-game commit used to add
+# extra spacing between requests; without it the API may answer 429, so each
+# 429 makes this pause longer for the rest of the run (never shorter).
+REQUEST_PAUSE_S = 0.3
+PAUSE_STEP_ON_429_S = 0.2
+MAX_REQUEST_PAUSE_S = 3.0
+request_pause = REQUEST_PAUSE_S
+
+BRONZE_SCHEMA = "ingestion_timestamp TIMESTAMP, source STRING, raw_json STRING"
+
 # Ensure the target Delta table exists
 spark.sql("""
     CREATE TABLE IF NOT EXISTS nhl.bronze.nhl_events (
@@ -45,51 +62,80 @@ spark.sql("""
 logger.info("Table nhl.bronze.nhl_events is ready")
 
 # ----------------------------------------------------------------------
-# Core function – fetch & store a single game
+# Core functions – fetch a single game, write games in batches
 # ----------------------------------------------------------------------
-def process_game(game_id: str) -> bool:
+def fetch_game(game_id: str):
     """
-    Fetch play-by-play JSON for a given game_id and append it to the bronze Delta table.
-    Returns True if the game was successfully stored, False otherwise.
+    Fetch play-by-play JSON for a given game_id.
+    Returns a Row for the bronze table, or None if the game couldn't be fetched
+    or isn't final. A 429 is retried after a backoff and slows down every
+    request after it.
     """
+    global request_pause
     url = f"{BASE_URL}/gamecenter/{game_id}/play-by-play"
     logger.info(f"Fetching play-by-play for game_id={game_id} — {url}")
 
-    try:
-        response = requests.get(url, timeout=30)
-        if response.status_code != 200:
-            logger.error(f"Request failed with status {response.status_code} for game {game_id}")
-            return False
+    for attempt in range(1, 6):
+        try:
+            response = requests.get(url, timeout=30)
+            if response.status_code == 429:
+                wait = 2 ** attempt
+                request_pause = min(request_pause + PAUSE_STEP_ON_429_S, MAX_REQUEST_PAUSE_S)
+                logger.warning(f"429 for game {game_id}, waiting {wait}s (attempt {attempt}); "
+                               f"pause between requests now {request_pause:.1f}s")
+                time.sleep(wait)
+                continue
+            if response.status_code != 200:
+                logger.error(f"Request failed with status {response.status_code} for game {game_id}")
+                return None
 
-        data = response.json()
-        logger.info(f"Request succeeded — {len(response.content)} bytes received")
+            data = response.json()
+            logger.info(f"Request succeeded — {len(response.content)} bytes received")
 
-        # Safety net: the schedule said final, but don't trust it blindly
-        game_state = data.get("gameState")
-        if game_state not in FINAL_STATES:
-            logger.info(f"Skipping game {game_id}: gameState={game_state} (not final yet)")
-            return False
+            # Safety net: the schedule said final, but don't trust it blindly
+            game_state = data.get("gameState")
+            if game_state not in FINAL_STATES:
+                logger.info(f"Skipping game {game_id}: gameState={game_state} (not final yet)")
+                return None
 
-        raw_json_str = json.dumps(data)
+            return Row(
+                ingestion_timestamp=datetime.now(),
+                source=url,
+                raw_json=json.dumps(data),
+            )
 
-        row = Row(
-            ingestion_timestamp=datetime.now(),
-            source=url,
-            raw_json=raw_json_str
-        )
-        df = spark.createDataFrame([row])
+        except Exception as e:
+            logger.error(f"Exception while fetching game {game_id}: {e}")
+            return None
+    logger.error(f"Giving up on game {game_id} after repeated 429s")
+    return None
 
-        df.write \
-            .format("delta") \
-            .mode("append") \
-            .saveAsTable("nhl.bronze.nhl_events")
 
-        logger.info(f"Data for game {game_id} inserted into nhl.bronze.nhl_events")
-        return True
-
-    except Exception as e:
-        logger.error(f"Exception while processing game {game_id}: {e}")
-        return False
+def write_games(rows: list) -> None:
+    """
+    Append a batch of games to the bronze table in one commit, retrying on
+    failure. If a commit actually landed but still reported an error, the
+    retry stores those games twice; batch_silver keeps the newest row per game,
+    so that's harmless.
+    """
+    for attempt in range(1, MAX_FLUSH_RETRIES + 1):
+        try:
+            spark.createDataFrame(rows, schema=BRONZE_SCHEMA) \
+                .write \
+                .format("delta") \
+                .mode("append") \
+                .saveAsTable("nhl.bronze.nhl_events")
+            logger.info(f"Inserted {len(rows)} games into nhl.bronze.nhl_events")
+            return
+        except Exception as e:
+            if attempt == MAX_FLUSH_RETRIES:
+                raise
+            delay = FLUSH_RETRY_BASE_DELAY * (2 ** (attempt - 1))
+            logger.warning(
+                f"Write attempt {attempt}/{MAX_FLUSH_RETRIES} failed "
+                f"({type(e).__name__}), retrying in {delay}s..."
+            )
+            time.sleep(delay)
 
 # ----------------------------------------------------------------------
 # Helpers to discover game IDs
@@ -155,13 +201,27 @@ if __name__ == "__main__":
                  if f"{BASE_URL}/gamecenter/{gid}/play-by-play" not in existing_urls]
     logger.info(f"Already loaded: {len(existing_urls)} | New to process: {len(new_games)}")
 
-    # ----- Process each new game -----
+    # ----- Process each new game, writing FLUSH_EVERY games per commit -----
+    # Games still in the buffer when the run dies are lost from this run only:
+    # they aren't in the table, so the next run fetches them again.
+    buffer = []
     success_count = 0
-    for idx, gid in enumerate(new_games, 1):
-        logger.info(f"Processing {idx}/{len(new_games)}: game {gid}")
-        if process_game(gid):
-            success_count += 1
-        # A small pause between requests to be kind to the API
-        time.sleep(0.3)
+    try:
+        for idx, gid in enumerate(new_games, 1):
+            logger.info(f"Processing {idx}/{len(new_games)}: game {gid}")
+            row = fetch_game(gid)
+            if row is not None:
+                buffer.append(row)
+            if len(buffer) >= FLUSH_EVERY:
+                write_games(buffer)
+                success_count += len(buffer)
+                buffer = []
+            # A small pause between requests to be kind to the API
+            time.sleep(request_pause)
+    finally:
+        if buffer:
+            write_games(buffer)
+            success_count += len(buffer)
 
-    logger.info(f"Done. Successfully stored {success_count}/{len(new_games)} new games.")
+    logger.info(f"Done. Successfully stored {success_count}/{len(new_games)} new games "
+                f"(pause between requests ended at {request_pause:.1f}s).")
