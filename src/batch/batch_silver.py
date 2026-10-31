@@ -12,7 +12,11 @@ sys.path.insert(0, str(next(
     (p / "src" / "common" for p in [_cwd, *_cwd.parents] if (p / "src" / "common").is_dir()),
     _cwd,
 )))
-from silver_parse import SILVER_TABLE, SILVER_SCHEMA, parse_plays, player_names  # noqa: E402
+from silver_parse import (  # noqa: E402
+    GAMES_TABLE, ROSTERS_TABLE, PLAYS_TABLE,
+    GAMES_SCHEMA, ROSTERS_SCHEMA, PLAYS_SCHEMA,
+    parse_game, parse_roster, parse_plays,
+)
 
 # ----------------------------------------------------------------------
 # Setup (run once)
@@ -32,7 +36,7 @@ logging.basicConfig(
 logger = logging.getLogger("batch_silver")
 logger.info(f"batch_silver started — log: {log_file}")
 
-CHUNK_SIZE = 500         # flush play rows to Delta every N games
+CHUNK_SIZE = 500         # flush silver rows to Delta every N games
 BRONZE_BATCH_SIZE = 50  # raw JSON rows fetched from bronze per batch
 MAX_FLUSH_RETRIES = 5
 FLUSH_RETRY_BASE_DELAY = 30  # seconds; doubles each attempt (30, 60, 120, 240, ...)
@@ -40,10 +44,8 @@ FLUSH_RETRY_BASE_DELAY = 30  # seconds; doubles each attempt (30, 60, 120, 240, 
 RUN_TIMESTAMP = datetime.now()  # when this run wrote to silver (ingestion_timestamp)
 
 
-# One row per bronze row this script has handled — including games with no
-# plays (most pre-2010 games), which never get a row in SILVER_TABLE and so
-# would otherwise be re-read and re-parsed on every run.
-# Drop it together with SILVER_TABLE when rebuilding silver.
+# One row per bronze row this script has handled, so a run only parses bronze
+# rows it hasn't seen. Drop it together with the silver tables when rebuilding.
 PROCESSED_TABLE = "nhl.silver.processed_games"
 
 
@@ -63,21 +65,29 @@ def _with_retries(write, what: str) -> None:
             time.sleep(delay)
 
 
-def _flush(buf: list, game_ids: list, tracking: list) -> None:
+def _replace_games(df_rows: list, schema, table: str, predicate: str) -> None:
+    _with_retries(
+        lambda: spark.createDataFrame(df_rows, schema=schema)
+            .write.format("delta").mode("overwrite")
+            .option("replaceWhere", predicate)
+            .saveAsTable(table),
+        f"Write to {table}",
+    )
+
+
+def _flush(games: list, rosters: list, plays: list, tracking: list) -> None:
     # replaceWhere swaps out every existing row for these games (e.g. rows the
-    # live pipeline wrote while the game was on) in one atomic commit, so a
-    # retry can never duplicate plays.
-    if game_ids:  # empty when the chunk only held duplicate bronze rows
-        predicate = f"game_id IN ({','.join(str(g) for g in game_ids)})"
-        _with_retries(
-            lambda: spark.createDataFrame(buf, schema=SILVER_SCHEMA)
-                .write.format("delta").mode("overwrite")
-                .option("replaceWhere", predicate)
-                .saveAsTable(SILVER_TABLE),
-            "Flush",
-        )
-    # Recorded only after the plays are written: if the run dies in between,
-    # the chunk is simply re-processed next run (replaceWhere is idempotent).
+    # live pipeline wrote while the game was on) in one atomic commit per
+    # table, so a retry can never duplicate rows. Delta has no transaction
+    # across tables, so games goes last: a game row means its rosters and
+    # plays are already in place.
+    if games:  # empty when the chunk only held duplicate bronze rows
+        predicate = f"game_id IN ({','.join(str(g['game_id']) for g in games)})"
+        _replace_games(rosters, ROSTERS_SCHEMA, ROSTERS_TABLE, predicate)
+        _replace_games(plays,   PLAYS_SCHEMA,   PLAYS_TABLE,   predicate)
+        _replace_games(games,   GAMES_SCHEMA,   GAMES_TABLE,   predicate)
+    # Recorded only after silver is written: if the run dies in between, the
+    # chunk is simply re-processed next run (replaceWhere is idempotent).
     _with_retries(
         lambda: spark.createDataFrame(tracking, schema=PROCESSED_SCHEMA)
             .write.format("delta").mode("append")
@@ -138,170 +148,43 @@ KNOWN_DETAIL_FIELDS = {
 _seen_warnings: set = set()
 
 # ----------------------------------------------------------------------
-# Ensure silver table exists
+# Ensure silver tables exist
 # ----------------------------------------------------------------------
 spark.sql("CREATE SCHEMA IF NOT EXISTS nhl.silver")
 
-spark.sql("""
-    CREATE TABLE IF NOT EXISTS nhl.silver.nhl_plays (
-        game_id                 BIGINT,
-        season                  INT,
-        game_type               INT,
-        limited_scoring         BOOLEAN,
-        game_date               DATE,
-        venue                   STRING,
-        venue_location          STRING,
-        start_time_utc          TIMESTAMP,
-        eastern_utc_offset      STRING,
-        venue_utc_offset        STRING,
-        game_state              STRING,
-        game_schedule_state     STRING,
-        away_team_id            INT,
-        away_team_abbrev        STRING,
-        away_team_name          STRING,
-        away_final_score        INT,
-        away_final_sog          INT,
-        home_team_id            INT,
-        home_team_abbrev        STRING,
-        home_team_name          STRING,
-        home_final_score        INT,
-        home_final_sog          INT,
-        last_period_type        STRING,
-        reg_periods             INT,
-        special_event           STRING,
-        event_id                INT,
-        period_number           INT,
-        period_type             STRING,
-        time_in_period          STRING,
-        time_remaining          STRING,
-        type_code               INT,
-        type_desc_key           STRING,
-        sort_order              INT,
-        x_coord                 INT,
-        y_coord                 INT,
-        zone_code               STRING,
-        home_team_defending_side STRING,
-        event_owner_team_id     INT,
-        shot_type               STRING,
-        scoring_player_total    INT,
-        assist1_player_total    INT,
-        assist2_player_total    INT,
-        assist3_player_total    INT,
-        away_score              INT,
-        home_score              INT,
-        away_sog                INT,
-        home_sog                INT,
-        penalty_type_code       STRING,
-        penalty_desc_key        STRING,
-        penalty_duration        INT,
-        stoppage_reason         STRING,
-        secondary_stoppage_reason STRING,
-        situation_code           STRING,
-        shooting_player_name     STRING,
-        goalie_in_net_name       STRING,
-        scoring_player_name      STRING,
-        assist1_player_name      STRING,
-        assist2_player_name      STRING,
-        assist3_player_name      STRING,
-        hitting_player_name      STRING,
-        hittee_player_name       STRING,
-        blocking_player_name     STRING,
-        winning_player_name      STRING,
-        losing_player_name       STRING,
-        committed_by_player_name STRING,
-        drawn_by_player_name     STRING,
-        served_by_player_name    STRING,
-        player_name              STRING,
-        shooting_player_id       BIGINT,
-        goalie_in_net_id         BIGINT,
-        scoring_player_id        BIGINT,
-        assist1_player_id        BIGINT,
-        assist2_player_id        BIGINT,
-        assist3_player_id        BIGINT,
-        hitting_player_id        BIGINT,
-        hittee_player_id         BIGINT,
-        blocking_player_id       BIGINT,
-        winning_player_id        BIGINT,
-        losing_player_id         BIGINT,
-        committed_by_player_id   BIGINT,
-        drawn_by_player_id       BIGINT,
-        served_by_player_id      BIGINT,
-        player_id                BIGINT,
-        highlight_clip               BIGINT,
-        highlight_clip_fr            BIGINT,
-        highlight_clip_sharing_url    STRING,
-        highlight_clip_sharing_url_fr STRING,
-        discrete_clip                BIGINT,
-        discrete_clip_fr             BIGINT,
-        ppt_replay_url               STRING,
-        source                   STRING,
-        is_final                 BOOLEAN,
-        fetched_at               TIMESTAMP,
-        ingestion_timestamp      TIMESTAMP
-    ) USING DELTA
-    CLUSTER BY (game_id)
-""")
+# nhl_plays used to be one wide table with the game context and player names
+# on every play. Its columns don't fit the normalised layout, so it has to be
+# rebuilt from bronze rather than altered in place.
+_old_layout = spark.sql(f"""
+    SELECT 1 FROM nhl.information_schema.columns
+    WHERE table_schema = 'silver' AND table_name = 'nhl_plays' AND column_name = 'season'
+""").collect()
+if _old_layout:
+    msg = (
+        f"{PLAYS_TABLE} still has the old denormalised layout. Rebuild silver from bronze: "
+        f"DROP TABLE {PLAYS_TABLE}; DROP TABLE IF EXISTS {PROCESSED_TABLE}; then re-run this script."
+    )
+    logger.error(msg)
+    raise RuntimeError(msg)
 
-# Add columns introduced after the table was first created (safe to re-run)
-for col_ddl in [
-    "special_event            STRING",
-    "situation_code           STRING",
-    "assist3_player_total     INT",
-    "shooting_player_name     STRING",
-    "goalie_in_net_name       STRING",
-    "scoring_player_name      STRING",
-    "assist1_player_name      STRING",
-    "assist2_player_name      STRING",
-    "assist3_player_name      STRING",
-    "hitting_player_name      STRING",
-    "hittee_player_name       STRING",
-    "blocking_player_name     STRING",
-    "winning_player_name      STRING",
-    "losing_player_name       STRING",
-    "committed_by_player_name STRING",
-    "drawn_by_player_name     STRING",
-    "served_by_player_name    STRING",
-    "player_name              STRING",
-    "zone_code                STRING",
-    "home_team_defending_side STRING",
-    "secondary_stoppage_reason STRING",
-    "highlight_clip               BIGINT",
-    "highlight_clip_fr            BIGINT",
-    "highlight_clip_sharing_url    STRING",
-    "highlight_clip_sharing_url_fr STRING",
-    "discrete_clip                BIGINT",
-    "discrete_clip_fr             BIGINT",
-    "ppt_replay_url               STRING",
-    "shooting_player_id       BIGINT",
-    "goalie_in_net_id         BIGINT",
-    "scoring_player_id        BIGINT",
-    "assist1_player_id        BIGINT",
-    "assist2_player_id        BIGINT",
-    "assist3_player_id        BIGINT",
-    "hitting_player_id        BIGINT",
-    "hittee_player_id         BIGINT",
-    "blocking_player_id       BIGINT",
-    "winning_player_id        BIGINT",
-    "losing_player_id         BIGINT",
-    "committed_by_player_id   BIGINT",
-    "drawn_by_player_id       BIGINT",
-    "served_by_player_id      BIGINT",
-    "player_id                BIGINT",
-    "source                   STRING",
-    "is_final                 BOOLEAN",
-    "fetched_at               TIMESTAMP",
+
+def _ddl(schema: StructType) -> str:
+    return ",\n        ".join(f"{f.name} {f.dataType.simpleString().upper()}" for f in schema.fields)
+
+
+# Clustering on game_id keeps the per-game replaceWhere (batch and live) and
+# the gold joins from scanning whole tables.
+for table, schema in [
+    (GAMES_TABLE,   GAMES_SCHEMA),
+    (ROSTERS_TABLE, ROSTERS_SCHEMA),
+    (PLAYS_TABLE,   PLAYS_SCHEMA),
 ]:
-    try:
-        spark.sql(f"ALTER TABLE nhl.silver.nhl_plays ADD COLUMN {col_ddl}")
-    except Exception:
-        pass  # column already exists
-
-# Clustering on game_id keeps per-game replaceWhere (batch) and MERGE (live)
-# from scanning the whole table. No-op if the table was created with it.
-try:
-    spark.sql("ALTER TABLE nhl.silver.nhl_plays CLUSTER BY (game_id)")
-except Exception as e:
-    logger.warning(f"Could not enable clustering on game_id: {e}")
+    spark.sql(f"""
+        CREATE TABLE IF NOT EXISTS {table} (
+        {_ddl(schema)}
+        ) USING DELTA
+        CLUSTER BY (game_id)
+    """)
 
 PROCESSED_SCHEMA = StructType([
     StructField("bronze_event_id", LongType()),
@@ -319,7 +202,7 @@ spark.sql(f"""
     ) USING DELTA
 """)
 
-logger.info("Silver table ready.")
+logger.info("Silver tables ready.")
 
 # ----------------------------------------------------------------------
 # Schema validation
@@ -407,8 +290,8 @@ def validate_game(game_id: int, data: dict) -> None:
 if __name__ == "__main__":
     # Guard against a stale tracker: if silver was dropped/emptied but the
     # tracker wasn't, every game would be skipped and silver would stay empty.
-    if not spark.sql(f"SELECT 1 FROM {SILVER_TABLE} LIMIT 1").collect():
-        logger.warning(f"{SILVER_TABLE} is empty — clearing {PROCESSED_TABLE} so every game is processed")
+    if not spark.sql(f"SELECT 1 FROM {GAMES_TABLE} LIMIT 1").collect():
+        logger.warning(f"{GAMES_TABLE} is empty — clearing {PROCESSED_TABLE} so every game is processed")
         spark.sql(f"TRUNCATE TABLE {PROCESSED_TABLE}")
 
     # Only bronze rows not handled by a previous run. Newest first, so if a game
@@ -426,8 +309,9 @@ if __name__ == "__main__":
     )
     logger.info(f"Bronze rows not yet processed: {len(pending_event_ids)}")
 
-    buf = []
-    chunk_game_ids = []   # games whose rows this chunk replaces in silver
+    chunk_games   = []    # one row per game this chunk replaces in silver
+    chunk_rosters = []
+    chunk_plays   = []
     chunk_tracking = []   # (bronze_event_id, game_id, play_count, processed_at) for PROCESSED_TABLE
     seen_game_ids = set()
     processed = skipped = errors = 0
@@ -456,19 +340,18 @@ if __name__ == "__main__":
 
                 validate_game(game_id, data)  # warns on new fields; raises on missing required fields
 
-                plays = parse_plays(data, row.ingestion_timestamp, player_names(data), "batch", RUN_TIMESTAMP)
-                buf.extend(plays)
-                chunk_game_ids.append(game_id)
+                plays = parse_plays(data, "batch", RUN_TIMESTAMP)
+                chunk_plays.extend(plays)
+                chunk_rosters.extend(parse_roster(data, "batch", RUN_TIMESTAMP))
+                chunk_games.append(parse_game(data, row.ingestion_timestamp, "batch", RUN_TIMESTAMP))
                 chunk_tracking.append((row.event_id, game_id, len(plays), RUN_TIMESTAMP))
                 seen_game_ids.add(game_id)
                 processed += 1
 
                 if processed % CHUNK_SIZE == 0:
-                    logger.info(f"Flushing chunk — {processed} games, {len(buf)} play rows...")
-                    _flush(buf, chunk_game_ids, chunk_tracking)
-                    buf = []
-                    chunk_game_ids = []
-                    chunk_tracking = []
+                    logger.info(f"Flushing chunk — {processed} games, {len(chunk_plays)} play rows...")
+                    _flush(chunk_games, chunk_rosters, chunk_plays, chunk_tracking)
+                    chunk_games, chunk_rosters, chunk_plays, chunk_tracking = [], [], [], []
 
             except ValueError:
                 raise  # missing required field — halt immediately
@@ -477,7 +360,7 @@ if __name__ == "__main__":
                 errors += 1
 
     if chunk_tracking:
-        logger.info(f"Flushing final chunk — {len(buf)} play rows...")
-        _flush(buf, chunk_game_ids, chunk_tracking)
+        logger.info(f"Flushing final chunk — {len(chunk_plays)} play rows...")
+        _flush(chunk_games, chunk_rosters, chunk_plays, chunk_tracking)
 
     logger.info(f"Done. Processed={processed} | Skipped={skipped} | Errors={errors}")

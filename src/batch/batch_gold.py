@@ -1,17 +1,18 @@
 """
 Gold layer — a Kimball-style star schema over NHL play-by-play data.
 
-Silver (nhl.silver.nhl_plays) is a flat, denormalised table of every play,
-written by both the nightly batch and the live pipeline. Gold is where the
-dimensional model lives.
+Silver is normalised into nhl.silver.games, nhl.silver.game_rosters and
+nhl.silver.nhl_plays, written by both the nightly batch and the live pipeline.
+Gold is where the dimensional model lives, and it reads silver only.
 
-  * fact_event is a VIEW over silver, so plays from games in progress show up
-    in gold the moment the live pipeline merges them, alongside the history.
+  * fact_event and dim_game are VIEWs over silver, so games in progress show
+    up in gold the moment the live pipeline writes them, alongside the history.
     Silver carries the real NHL player ids for every role, so the fact links to
     players by id — never by name, which would collide on duplicate names
     (e.g. two "Sebastian Aho").
-  * The dimensions are rebuilt from the bronze JSON (nhl.bronze.nhl_events),
-    which holds attributes silver doesn't (rosterSpots, logos, place names).
+  * The other dimensions are tables rebuilt from silver each run. A player
+    making their debut in a live game reaches dim_player on the next run;
+    until then their name is in nhl.silver.game_rosters.
 
 Grain & paradigm
 ----------------
@@ -25,27 +26,26 @@ and collision-free.
         dim_game ─┘                 ├─ dim_player  (role-playing)
    dim_event_type ─────────────────┘
 
-Objects produced (tables fully overwritten each run — idempotent, safe to re-run):
+Objects produced (tables fully overwritten each run, views replaced — idempotent, safe to re-run):
   nhl.gold.dim_player      one row per player_id (Type 1 — current attributes)
   nhl.gold.dim_player_team player↔team stint history (trades) with valid_from/
                            valid_to/is_current — the slowly-changing part
   nhl.gold.dim_team        one row per team_id
-  nhl.gold.dim_game        one row per game_id
+  nhl.gold.dim_game        VIEW over silver.games — one row per game_id
   nhl.gold.dim_date        one row per calendar day, 1917-01-01 to the end of
                            next year (so live games always have a date row)
   nhl.gold.dim_event_type  one row per event type_code
   nhl.gold.fact_event      VIEW over silver — one row per play, real player-id
                            FK per role, plus source/is_final lineage
 
-The parsing is fully distributed (from_json + explode) — no driver-side JSON
-work, so there is no OOM risk regardless of game count.
+All builds are distributed Spark/SQL over silver — no driver-side work.
 """
 
 import logging
 from pathlib import Path
 from datetime import datetime
 
-from pyspark.sql import functions as F, types as T, Window
+from pyspark.sql import functions as F, Window
 
 # ----------------------------------------------------------------------
 # Setup (run once)
@@ -66,8 +66,9 @@ logging.basicConfig(
 logger = logging.getLogger("batch_gold")
 logger.info(f"batch_gold started — log: {log_file}")
 
-BRONZE_TABLE = "nhl.bronze.nhl_events"
-SILVER_TABLE = "nhl.silver.nhl_plays"
+GAMES_TABLE   = "nhl.silver.games"
+ROSTERS_TABLE = "nhl.silver.game_rosters"
+PLAYS_TABLE   = "nhl.silver.nhl_plays"
 
 DIM_PLAYER_TABLE     = "nhl.gold.dim_player"
 DIM_PLAYER_TEAM_TABLE = "nhl.gold.dim_player_team"
@@ -77,117 +78,42 @@ DIM_DATE_TABLE       = "nhl.gold.dim_date"
 DIM_EVENT_TYPE_TABLE = "nhl.gold.dim_event_type"
 FACT_EVENT_TABLE     = "nhl.gold.fact_event"
 
-# Transient: holds the parsed-once canonical games so serverless compute (no
-# cache/persist) still parses the bronze JSON only once. Dropped at the end.
-STAGING_GAMES_TABLE  = "nhl.gold.staging_canonical_games"
-
 # Legacy tables from the previous, non-dimensional gold design — superseded by
 # the star schema below and fully reproducible, so we drop them for a clean layer.
 LEGACY_TABLES = [
     "nhl.gold.player_stats",
     "nhl.gold.team_stats",
     "nhl.gold.dim_players",
+    "nhl.gold.staging_canonical_games",   # staging table from when gold parsed bronze
 ]
 
 # ----------------------------------------------------------------------
-# JSON schema for the bronze raw_json blob — only the game-level fields the
-# dimensions consume (from_json silently ignores everything else). Localised
-# NHL strings are {"default": "..."} objects.
+# Silver inputs
 # ----------------------------------------------------------------------
-_LOC = T.StructType([T.StructField("default", T.StringType())])
-
-_TEAM = T.StructType([
-    T.StructField("id",         T.IntegerType()),
-    T.StructField("abbrev",     T.StringType()),
-    T.StructField("commonName", _LOC),
-    T.StructField("placeName",  _LOC),
-    T.StructField("score",      T.IntegerType()),
-    T.StructField("sog",        T.IntegerType()),
-    T.StructField("logo",       T.StringType()),
-    T.StructField("darkLogo",   T.StringType()),
-])
-
-_ROSTER_SPOT = T.StructType([
-    T.StructField("teamId",        T.IntegerType()),
-    T.StructField("playerId",      T.LongType()),
-    T.StructField("firstName",     _LOC),
-    T.StructField("lastName",      _LOC),
-    T.StructField("sweaterNumber", T.IntegerType()),
-    T.StructField("positionCode",  T.StringType()),
-    T.StructField("headshot",      T.StringType()),
-])
-
-_GAME = T.StructType([
-    T.StructField("id",                T.LongType()),
-    T.StructField("season",            T.IntegerType()),
-    T.StructField("gameType",          T.IntegerType()),
-    T.StructField("gameDate",          T.StringType()),
-    T.StructField("startTimeUTC",      T.StringType()),
-    T.StructField("gameState",         T.StringType()),
-    T.StructField("gameScheduleState", T.StringType()),
-    T.StructField("limitedScoring",    T.BooleanType()),
-    T.StructField("regPeriods",        T.IntegerType()),
-    T.StructField("venue",             _LOC),
-    T.StructField("venueLocation",     _LOC),
-    T.StructField("gameOutcome",       T.StructType([T.StructField("lastPeriodType", T.StringType())])),
-    T.StructField("awayTeam",          _TEAM),
-    T.StructField("homeTeam",          _TEAM),
-    T.StructField("rosterSpots",       T.ArrayType(_ROSTER_SPOT)),
-    # plays are not parsed here — fact_event reads them from silver
-])
-
-
-# ----------------------------------------------------------------------
-# Parse bronze once → one canonical row per game
-# ----------------------------------------------------------------------
-def load_canonical_games(spark):
-    """
-    Parse every bronze JSON blob and return exactly one row per game_id
-    (the most recently ingested, in case a game was re-loaded), with a
-    derived DATE game_date and integer date_key (yyyymmdd).
-    """
-    parsed = (
-        spark.table(BRONZE_TABLE)
-        .select("ingestion_timestamp", F.from_json("raw_json", _GAME).alias("g"))
-        .select("ingestion_timestamp", "g.*")
-        .filter(F.col("id").isNotNull())
-        .withColumn("game_date", F.to_date("gameDate"))
-        .withColumn("date_key", F.date_format("game_date", "yyyyMMdd").cast("int"))
-    )
-
-    latest = Window.partitionBy("id").orderBy(F.col("ingestion_timestamp").desc_nulls_last())
+def load_roster_spots(spark):
+    """One row per (game, player) from silver, with the game's date."""
     return (
-        parsed
-        .withColumn("_rn", F.row_number().over(latest))
-        .filter(F.col("_rn") == 1)
-        .drop("_rn")
+        spark.table(ROSTERS_TABLE)
+        .join(spark.table(GAMES_TABLE).select("game_id", "game_date"), "game_id")
+        .filter(F.col("player_id").isNotNull())
     )
 
 
 # ----------------------------------------------------------------------
 # Dimensions
 # ----------------------------------------------------------------------
-def build_dim_player(games):
+def build_dim_player(roster_spots):
     """One row per player_id, with the most recently seen descriptive attributes."""
-    spots = (
-        games
-        .select("game_date", F.explode("rosterSpots").alias("s"))
-        .select(
-            F.col("game_date"),
-            F.col("s.playerId").alias("player_id"),
-            F.concat_ws(
-                " ",
-                F.col("s.firstName.default"),
-                F.col("s.lastName.default"),
-            ).alias("full_name"),
-            F.col("s.firstName.default").alias("first_name"),
-            F.col("s.lastName.default").alias("last_name"),
-            F.col("s.positionCode").alias("position_code"),
-            F.col("s.sweaterNumber").alias("sweater_number"),
-            F.col("s.teamId").alias("team_id"),
-            F.col("s.headshot").alias("headshot_url"),
-        )
-        .filter(F.col("player_id").isNotNull())
+    spots = roster_spots.select(
+        "game_date",
+        "player_id",
+        F.concat_ws(" ", "first_name", "last_name").alias("full_name"),
+        "first_name",
+        "last_name",
+        "position_code",
+        "sweater_number",
+        "team_id",
+        "headshot_url",
     )
 
     bounds = spots.groupBy("player_id").agg(
@@ -215,29 +141,20 @@ def build_dim_player(games):
     )
 
 
-def build_dim_player_team(games):
+def build_dim_player_team(roster_spots):
     """
     Player↔team stint history (the slowly-changing part of a player's identity).
     One row per contiguous spell a player spent on a team, derived from per-game
-    rosterSpots. Captures trades — including mid-season moves and a player
+    rosters. Captures trades — including mid-season moves and a player
     returning to a former team (each spell is its own stint).
 
     Grain: (player_id, team_id, valid_from). Columns:
       player_id, team_id, valid_from, valid_to, games_in_stint, is_current
     """
     spots = (
-        games
-        .select("game_date", F.explode("rosterSpots").alias("s"))
-        .select(
-            F.col("game_date"),
-            F.col("s.playerId").alias("player_id"),
-            F.col("s.teamId").alias("team_id"),
-        )
-        .filter(
-            F.col("player_id").isNotNull()
-            & F.col("team_id").isNotNull()
-            & F.col("game_date").isNotNull()
-        )
+        roster_spots
+        .select("game_date", "player_id", "team_id")
+        .filter(F.col("team_id").isNotNull() & F.col("game_date").isNotNull())
     )
 
     # Collapse to one team per player per game (guards against any duplicate spots).
@@ -290,15 +207,14 @@ def build_dim_player_team(games):
 def build_dim_team(games):
     """One row per team_id, most recent descriptive attributes across home/away."""
     def _side(side):
-        t = f"{side}Team"
         return games.select(
             F.col("game_date"),
-            F.col(f"{t}.id").alias("team_id"),
-            F.col(f"{t}.abbrev").alias("abbrev"),
-            F.col(f"{t}.commonName.default").alias("team_name"),
-            F.col(f"{t}.placeName.default").alias("place_name"),
-            F.col(f"{t}.logo").alias("logo_url"),
-            F.col(f"{t}.darkLogo").alias("dark_logo_url"),
+            F.col(f"{side}_team_id").alias("team_id"),
+            F.col(f"{side}_team_abbrev").alias("abbrev"),
+            F.col(f"{side}_team_name").alias("team_name"),
+            F.col(f"{side}_team_place_name").alias("place_name"),
+            F.col(f"{side}_team_logo").alias("logo_url"),
+            F.col(f"{side}_team_dark_logo").alias("dark_logo_url"),
         )
 
     teams = _side("home").union(_side("away")).filter(F.col("team_id").isNotNull())
@@ -317,39 +233,56 @@ def build_dim_team(games):
     )
 
 
-def build_dim_game(games):
-    """One row per game_id holding all game-level context."""
-    return (
-        games.select(
-            F.col("id").alias("game_id"),
-            F.col("season"),
-            F.col("gameType").alias("game_type"),
-            F.col("game_date"),
-            F.col("date_key"),
-            F.to_timestamp("startTimeUTC").alias("start_time_utc"),
-            F.col("venue.default").alias("venue"),
-            F.col("venueLocation.default").alias("venue_location"),
-            F.col("gameState").alias("game_state"),
-            F.col("gameScheduleState").alias("game_schedule_state"),
-            F.col("limitedScoring").alias("limited_scoring"),
-            F.col("regPeriods").alias("reg_periods"),
-            F.col("gameOutcome.lastPeriodType").alias("last_period_type"),
-            F.col("homeTeam.id").alias("home_team_id"),
-            F.col("awayTeam.id").alias("away_team_id"),
-            F.col("homeTeam.score").alias("home_final_score"),
-            F.col("awayTeam.score").alias("away_final_score"),
-            F.col("homeTeam.sog").alias("home_final_sog"),
-            F.col("awayTeam.sog").alias("away_final_sog"),
-            F.current_timestamp().alias("ingestion_timestamp"),
-        )
-    )
+def create_view(spark, name: str, comment: str, select_sql: str) -> None:
+    """CREATE OR REPLACE VIEW, dropping a table of the same name first."""
+    # Several gold objects used to be tables, and a view can't replace a table in place.
+    schema, table = name.split(".")[1:]
+    existing = spark.sql(f"""
+        SELECT table_type FROM nhl.information_schema.tables
+        WHERE table_schema = '{schema}' AND table_name = '{table}'
+    """).collect()
+    if existing and existing[0].table_type != "VIEW":
+        spark.sql(f"DROP TABLE {name}")
+        logger.info(f"Dropped old {name} table (replaced by a view over silver)")
+    spark.sql(f"CREATE OR REPLACE VIEW {name} COMMENT '{comment}' AS {select_sql}")
+    logger.info(f"Created view: {name}")
+
+
+def create_dim_game_view(spark):
+    """One row per game_id holding all game-level context — live games included."""
+    create_view(spark, DIM_GAME_TABLE, f"One row per game — batch history + live games, over {GAMES_TABLE}", f"""
+        SELECT
+            game_id,
+            season,
+            game_type,
+            game_date,
+            CAST(date_format(game_date, 'yyyyMMdd') AS INT) AS date_key,
+            start_time_utc,
+            venue,
+            venue_location,
+            game_state,
+            game_schedule_state,
+            limited_scoring,
+            reg_periods,
+            last_period_type,
+            home_team_id,
+            away_team_id,
+            home_final_score,
+            away_final_score,
+            home_final_sog,
+            away_final_sog,
+            source,
+            is_final,
+            ingestion_timestamp
+        FROM {GAMES_TABLE}
+    """)
 
 
 def build_dim_date(spark):
     """
     Standard calendar dimension: every day from the first NHL season to the end
     of next year. Generated rather than derived from games, so tonight's live
-    games (not in bronze until they're final) still join to a date row.
+    games still join to a date row before any nightly run has seen them.
     """
     return (
         spark.range(1)
@@ -390,22 +323,11 @@ def create_fact_event_view(spark):
     Lineage: source = 'batch' (final, from bronze) or 'live' (game in progress);
     is_final says whether the game was over when the row was written.
     """
-    # fact_event used to be a table, and a view can't replace a table in place.
-    existing = spark.sql("""
-        SELECT table_type FROM nhl.information_schema.tables
-        WHERE table_schema = 'gold' AND table_name = 'fact_event'
-    """).collect()
-    if existing and existing[0].table_type != "VIEW":
-        spark.sql(f"DROP TABLE {FACT_EVENT_TABLE}")
-        logger.info(f"Dropped old {FACT_EVENT_TABLE} table (replaced by a view over silver)")
-
-    spark.sql(f"""
-        CREATE OR REPLACE VIEW {FACT_EVENT_TABLE}
-        COMMENT 'One row per play (game_id, event_id) — batch history + live games, over {SILVER_TABLE}'
-        AS SELECT
+    create_view(spark, FACT_EVENT_TABLE, "One row per play (game_id, event_id) — batch history + live games, over silver", f"""
+        SELECT
             -- foreign keys
-            game_id,
-            CAST(date_format(game_date, 'yyyyMMdd') AS INT) AS date_key,
+            p.game_id,
+            CAST(date_format(g.game_date, 'yyyyMMdd') AS INT) AS date_key,
             type_code,
             event_owner_team_id,
             -- player-role foreign keys (→ dim_player)
@@ -423,7 +345,7 @@ def create_fact_event_view(spark):
             committed_by_player_id,
             drawn_by_player_id,
             served_by_player_id,
-            player_id,
+            p.player_id,
             -- degenerate dimensions / play descriptors
             event_id,
             sort_order,
@@ -453,12 +375,13 @@ def create_fact_event_view(spark):
             stoppage_reason,
             secondary_stoppage_reason,
             -- lineage
-            source,
-            is_final,
-            fetched_at,
-            ingestion_timestamp
-        FROM {SILVER_TABLE}
-        WHERE event_id IS NOT NULL
+            p.source,
+            g.is_final,
+            g.fetched_at,
+            p.ingestion_timestamp
+        FROM {PLAYS_TABLE} p
+        JOIN {GAMES_TABLE} g ON g.game_id = p.game_id
+        WHERE p.event_id IS NOT NULL
     """)
 
 
@@ -501,24 +424,20 @@ for legacy in LEGACY_TABLES:
     spark.sql(f"DROP TABLE IF EXISTS {legacy}")
     logger.info(f"Dropped legacy table (superseded by star schema): {legacy}")
 
-# Serverless compute does not support cache()/persist(), so we materialise the
-# parsed-once canonical games to a staging Delta table and read it back for every
-# downstream build — this parses the bronze JSON a single time.
-overwrite_table(load_canonical_games(spark), STAGING_GAMES_TABLE)
-games = spark.table(STAGING_GAMES_TABLE)
-logger.info(f"Canonical games parsed: {games.count()}")
+roster_spots = load_roster_spots(spark)
+games = spark.table(GAMES_TABLE)
 
 logger.info("Building dim_player…")
-overwrite_table(build_dim_player(games), DIM_PLAYER_TABLE)
+overwrite_table(build_dim_player(roster_spots), DIM_PLAYER_TABLE)
 
 logger.info("Building dim_player_team…")
-overwrite_table(build_dim_player_team(games), DIM_PLAYER_TEAM_TABLE)
+overwrite_table(build_dim_player_team(roster_spots), DIM_PLAYER_TEAM_TABLE)
 
 logger.info("Building dim_team…")
 overwrite_table(build_dim_team(games), DIM_TEAM_TABLE)
 
-logger.info("Building dim_game…")
-overwrite_table(build_dim_game(games), DIM_GAME_TABLE)
+logger.info("Creating dim_game view over silver…")
+create_dim_game_view(spark)
 
 logger.info("Building dim_date…")
 overwrite_table(build_dim_date(spark), DIM_DATE_TABLE)
@@ -529,8 +448,5 @@ fact_event = spark.table(FACT_EVENT_TABLE)
 
 logger.info("Building dim_event_type…")
 overwrite_table(build_dim_event_type(fact_event), DIM_EVENT_TYPE_TABLE)
-
-spark.sql(f"DROP TABLE IF EXISTS {STAGING_GAMES_TABLE}")
-logger.info("Dropped staging table.")
 
 logger.info("batch_gold complete.")

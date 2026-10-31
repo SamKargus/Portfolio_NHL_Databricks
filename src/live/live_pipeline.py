@@ -10,10 +10,11 @@ progress. Started and stopped by src/live/live_poller.py around game times.
      ├─► nhl.bronze.nhl_pbp_live_plays   one row per play per fetch,    (live bronze,
      │                                   raw play JSON, append-only      play grain)
      └─► silver_live_sink (foreach_batch_sink)
-            • nhl.silver.nhl_plays   newest snapshot per game replaces that
-                                     game's live rows (source = 'live')
-            • nhl.gold.dim_game      upsert, so live plays join to a game row
-            • nhl.gold.dim_player    insert debut players only
+            newest snapshot per game replaces that game's live rows
+            (source = 'live') in all three silver tables:
+            • nhl.silver.game_rosters
+            • nhl.silver.nhl_plays
+            • nhl.silver.games          (written last)
 
 The sink reads nhl_pbp_live_raw (one row per file), not the plays table, so
 every micro-batch holds complete snapshots — which is what makes replacing a
@@ -21,8 +22,10 @@ game's live rows with its newest snapshot correct (it also drops plays the NHL
 removed). Rows are built by src/common/silver_parse.py, the same code the
 nightly batch uses, so live and batch rows can't drift apart.
 
-Once a game has batch rows in silver (the nightly run after it's final), the
-sink leaves it alone — batch is the source of truth for finished games.
+Once a game's silver row says source = 'batch' (the nightly run after it's
+final), the sink leaves it alone — batch is the source of truth for finished
+games. The pipeline writes nothing to gold: gold's fact_event and dim_game are
+views over silver, so live games show up there straight away.
 
 Pipeline settings
 -----------------
@@ -38,8 +41,7 @@ import logging
 from datetime import datetime
 
 from pyspark import pipelines as dp
-from pyspark.sql import functions as F, types as T, Window
-from delta.tables import DeltaTable
+from pyspark.sql import functions as F, Window
 
 logger = logging.getLogger("live_pipeline")
 
@@ -50,48 +52,6 @@ if not SRC_COMMON_PATH:
         "Set pipeline configuration nhl.live.src_common_path to the workspace path "
         "of src/common (e.g. /Workspace/Users/<you>/Portfolio_NHL_Databricks/src/common)"
     )
-
-DIM_GAME_TABLE   = "nhl.gold.dim_game"
-DIM_PLAYER_TABLE = "nhl.gold.dim_player"
-
-# Column types match build_dim_game / build_dim_player in batch_gold.py
-DIM_GAME_SCHEMA = T.StructType([
-    T.StructField("game_id",             T.LongType()),
-    T.StructField("season",              T.IntegerType()),
-    T.StructField("game_type",           T.IntegerType()),
-    T.StructField("game_date",           T.DateType()),
-    T.StructField("date_key",            T.IntegerType()),
-    T.StructField("start_time_utc",      T.TimestampType()),
-    T.StructField("venue",               T.StringType()),
-    T.StructField("venue_location",      T.StringType()),
-    T.StructField("game_state",          T.StringType()),
-    T.StructField("game_schedule_state", T.StringType()),
-    T.StructField("limited_scoring",     T.BooleanType()),
-    T.StructField("reg_periods",         T.IntegerType()),
-    T.StructField("last_period_type",    T.StringType()),
-    T.StructField("home_team_id",        T.IntegerType()),
-    T.StructField("away_team_id",        T.IntegerType()),
-    T.StructField("home_final_score",    T.IntegerType()),
-    T.StructField("away_final_score",    T.IntegerType()),
-    T.StructField("home_final_sog",      T.IntegerType()),
-    T.StructField("away_final_sog",      T.IntegerType()),
-    T.StructField("ingestion_timestamp", T.TimestampType()),
-])
-
-DIM_PLAYER_SCHEMA = T.StructType([
-    T.StructField("player_id",           T.LongType()),
-    T.StructField("full_name",           T.StringType()),
-    T.StructField("first_name",          T.StringType()),
-    T.StructField("last_name",           T.StringType()),
-    T.StructField("position_code",       T.StringType()),
-    T.StructField("sweater_number",      T.IntegerType()),
-    T.StructField("team_id",             T.IntegerType()),
-    T.StructField("headshot_url",        T.StringType()),
-    T.StructField("first_seen_date",     T.DateType()),
-    T.StructField("last_seen_date",      T.DateType()),
-    T.StructField("ingestion_timestamp", T.TimestampType()),
-])
-
 
 # ----------------------------------------------------------------------
 # Live bronze — raw snapshots via Auto Loader
@@ -147,37 +107,8 @@ def nhl_pbp_live_plays():
 
 
 # ----------------------------------------------------------------------
-# Silver + gold dims — written by a sink, since the pipeline doesn't own them
+# Silver — written by a sink, since the pipeline doesn't own those tables
 # ----------------------------------------------------------------------
-def _dim_game_row(ctx: dict) -> dict:
-    row = {f.name: ctx.get(f.name) for f in DIM_GAME_SCHEMA.fields}
-    row["date_key"] = int(ctx["game_date"].strftime("%Y%m%d")) if ctx.get("game_date") else None
-    return row
-
-
-def _dim_player_rows(data: dict, game_date, ingestion_ts: datetime) -> list:
-    rows = []
-    for spot in data.get("rosterSpots") or []:
-        if not spot.get("playerId"):
-            continue
-        first = (spot.get("firstName") or {}).get("default")
-        last  = (spot.get("lastName") or {}).get("default")
-        rows.append({
-            "player_id":           int(spot["playerId"]),
-            "full_name":           " ".join(p for p in (first, last) if p),
-            "first_name":          first,
-            "last_name":           last,
-            "position_code":       spot.get("positionCode"),
-            "sweater_number":      spot.get("sweaterNumber"),
-            "team_id":             spot.get("teamId"),
-            "headshot_url":        spot.get("headshot"),
-            "first_seen_date":     game_date,
-            "last_seen_date":      game_date,
-            "ingestion_timestamp": ingestion_ts,
-        })
-    return rows
-
-
 @dp.foreach_batch_sink(name="silver_live_sink")
 def write_live_snapshots(df, batch_id):
     # Imported here, not at module level: the sink function may be serialised
@@ -186,7 +117,11 @@ def write_live_snapshots(df, batch_id):
     import sys
     if SRC_COMMON_PATH not in sys.path:
         sys.path.insert(0, SRC_COMMON_PATH)
-    from silver_parse import SILVER_TABLE, SILVER_SCHEMA, parse_game_context, parse_plays, player_names
+    from silver_parse import (
+        GAMES_TABLE, ROSTERS_TABLE, PLAYS_TABLE,
+        GAMES_SCHEMA, ROSTERS_SCHEMA, PLAYS_SCHEMA,
+        parse_game, parse_roster, parse_plays,
+    )
 
     session = df.sparkSession
 
@@ -203,18 +138,13 @@ def write_live_snapshots(df, batch_id):
         return
 
     # 2. Skip games batch already owns, and snapshots older than what silver has
-    #    (a late file).
-    game_ids = [r.game_id for r in snapshots]
+    #    (a late file). silver.games holds one row per game with its lineage.
     existing = {
         r.game_id: r
         for r in (
-            session.table(SILVER_TABLE)
-            .filter(F.col("game_id").isin(game_ids))
-            .groupBy("game_id")
-            .agg(
-                F.max(F.when(F.col("source") == "live", F.col("fetched_at"))).alias("live_fetched_at"),
-                F.max((F.col("source") == "batch").cast("int")).alias("has_batch"),
-            )
+            session.table(GAMES_TABLE)
+            .filter(F.col("game_id").isin([s.game_id for s in snapshots]))
+            .select("game_id", "source", "fetched_at")
             .collect()
         )
     }
@@ -223,9 +153,9 @@ def write_live_snapshots(df, batch_id):
         e = existing.get(snap.game_id)
         if e is None:
             return True
-        if e.has_batch:
+        if e.source == "batch":
             return False
-        return e.live_fetched_at is None or snap.fetched_at >= e.live_fetched_at
+        return e.fetched_at is None or snap.fetched_at >= e.fetched_at
 
     snapshots = [s for s in snapshots if _apply(s)]
     if not snapshots:
@@ -233,49 +163,32 @@ def write_live_snapshots(df, batch_id):
 
     # 3. Build silver rows with the same parser the nightly batch uses.
     now = datetime.now()
-    play_rows, game_rows, player_rows = [], [], {}
+    games, rosters, plays = [], [], []
     for snap in snapshots:
         data = json.loads(snap.raw_json)
-        play_rows.extend(parse_plays(data, snap.fetched_at, player_names(data), "live", now))
-        ctx = parse_game_context(data, snap.fetched_at, "live", now)
-        game_rows.append(_dim_game_row(ctx))
-        for p in _dim_player_rows(data, ctx.get("game_date"), now):
-            player_rows[p["player_id"]] = p
+        games.append(parse_game(data, snap.fetched_at, "live", now))
+        rosters.extend(parse_roster(data, "live", now))
+        plays.extend(parse_plays(data, "live", now))
 
-    # 4. Replace each game's live rows with its newest snapshot, atomically.
-    #    The snapshot is the game's complete play list, so this inserts new
-    #    plays, applies corrections and drops removed plays in one commit.
-    #    replaceWhere only touches these games' files (silver is clustered on
+    # 4. Replace each game's live rows with its newest snapshot. The snapshot
+    #    is the game's complete state, so this inserts new plays, applies
+    #    corrections and drops removed plays. Each table is one atomic commit;
+    #    games goes last, so a game row means its rosters and plays are in.
+    #    replaceWhere only touches these games' files (tables are clustered on
     #    game_id) and only rows with source = 'live'.
     ids_csv = ",".join(str(s.game_id) for s in snapshots)
-    (
-        session.createDataFrame(play_rows, schema=SILVER_SCHEMA)
-        .write.format("delta").mode("overwrite")
-        .option("replaceWhere", f"game_id IN ({ids_csv}) AND source = 'live'")
-        .saveAsTable(SILVER_TABLE)
-    )
-
-    # 5. Keep the dimensions joinable for games in progress. The nightly
-    #    batch_gold overwrites both tables from bronze, replacing these rows.
-    try:
+    for rows, schema, table in [
+        (rosters, ROSTERS_SCHEMA, ROSTERS_TABLE),
+        (plays,   PLAYS_SCHEMA,   PLAYS_TABLE),
+        (games,   GAMES_SCHEMA,   GAMES_TABLE),
+    ]:
         (
-            DeltaTable.forName(session, DIM_GAME_TABLE).alias("t")
-            .merge(session.createDataFrame(game_rows, schema=DIM_GAME_SCHEMA).alias("s"),
-                   "t.game_id = s.game_id")
-            .whenMatchedUpdateAll(condition="t.game_state NOT IN ('OFF', 'FINAL')")  # never touch batch rows
-            .whenNotMatchedInsertAll()
-            .execute()
+            session.createDataFrame(rows, schema=schema)
+            .write.format("delta").mode("overwrite")
+            .option("replaceWhere", f"game_id IN ({ids_csv}) AND source = 'live'")
+            .saveAsTable(table)
         )
-        if player_rows:
-            (
-                DeltaTable.forName(session, DIM_PLAYER_TABLE).alias("t")
-                .merge(session.createDataFrame(list(player_rows.values()), schema=DIM_PLAYER_SCHEMA).alias("s"),
-                       "t.player_id = s.player_id")
-                .whenNotMatchedInsertAll()              # debut players only
-                .execute()
-            )
-    except Exception as e:  # e.g. gold not built yet — silver is what matters
-        logger.warning(f"batch {batch_id}: could not update gold dims: {e}")
+    logger.info(f"batch {batch_id}: wrote {len(games)} game(s), {len(plays)} plays to silver")
 
 
 @dp.append_flow(target="silver_live_sink", name="silver_live_flow")
