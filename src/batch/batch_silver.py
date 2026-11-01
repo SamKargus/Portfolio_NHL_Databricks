@@ -15,7 +15,7 @@ sys.path.insert(0, str(next(
 from silver_parse import (  # noqa: E402
     GAMES_TABLE, ROSTERS_TABLE, PLAYS_TABLE,
     GAMES_SCHEMA, ROSTERS_SCHEMA, PLAYS_SCHEMA,
-    parse_game, parse_roster, parse_plays,
+    parse_game, parse_roster, parse_plays, is_silver_game,
 )
 
 # ----------------------------------------------------------------------
@@ -115,7 +115,7 @@ KNOWN_GAME_FIELDS = REQUIRED_GAME_FIELDS | {
 
 REQUIRED_TEAM_FIELDS = {"id", "abbrev", "score", "commonName"}
 KNOWN_TEAM_FIELDS = REQUIRED_TEAM_FIELDS | {
-    "sog", "logo", "darkLogo", "placeName", "placeNameWithPreposition",
+    "sog", "logo", "darkLogo", "placeName", "placeNameWithPreposition", "radioLink",
 }
 
 REQUIRED_PLAY_FIELDS = {"eventId", "typeCode", "typeDescKey", "sortOrder"}
@@ -336,6 +336,12 @@ if __name__ == "__main__":
                     # Older duplicate bronze row for a game handled this run
                     chunk_tracking.append((row.event_id, game_id, None, RUN_TIMESTAMP))
                     skipped += 1
+                    continue
+
+                if not is_silver_game(data):
+                    chunk_tracking.append((row.event_id, game_id, None, RUN_TIMESTAMP))
+                    seen_game_ids.add(game_id)
+                    excluded += 1
                     continue
 
                 validate_game(game_id, data)  # warns on new fields; raises on missing required fields

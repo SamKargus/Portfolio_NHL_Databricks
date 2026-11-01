@@ -26,6 +26,10 @@ GAMES_TABLE   = "nhl.silver.games"
 ROSTERS_TABLE = "nhl.silver.game_rosters"
 PLAYS_TABLE   = "nhl.silver.nhl_plays"
 FINAL_STATES = {"OFF", "FINAL"}
+SILVER_GAME_TYPES = {1, 2, 3}
+
+def is_silver_game(data: dict) -> bool:
+    return _int(data.get("gameType")) in SILVER_GAME_TYPES
 
 # ----------------------------------------------------------------------
 # Type helpers
