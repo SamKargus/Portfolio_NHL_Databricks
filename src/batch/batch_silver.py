@@ -189,7 +189,7 @@ for table, schema in [
 PROCESSED_SCHEMA = StructType([
     StructField("bronze_event_id", LongType()),
     StructField("game_id",         LongType()),
-    StructField("play_count",      IntegerType()),   # NULL = duplicate bronze row, superseded
+    StructField("play_count",      IntegerType()),   # NULL = not loaded: duplicate bronze row or excluded game type
     StructField("processed_at",    TimestampType()),
 ])
 
@@ -314,7 +314,7 @@ if __name__ == "__main__":
     chunk_plays   = []
     chunk_tracking = []   # (bronze_event_id, game_id, play_count, processed_at) for PROCESSED_TABLE
     seen_game_ids = set()
-    processed = skipped = errors = 0
+    processed = skipped = excluded = errors = 0
 
     for batch_start in range(0, len(pending_event_ids), BRONZE_BATCH_SIZE):
         batch_ids = pending_event_ids[batch_start:batch_start + BRONZE_BATCH_SIZE]
@@ -338,6 +338,10 @@ if __name__ == "__main__":
                     skipped += 1
                     continue
 
+                # Checked before validate_game: All-Star and international games
+                # can have unusual JSON, and a missing required field there would
+                # halt the run over a game silver doesn't keep anyway. Tracked so
+                # it isn't re-read every run; it stays in bronze only.
                 if not is_silver_game(data):
                     chunk_tracking.append((row.event_id, game_id, None, RUN_TIMESTAMP))
                     seen_game_ids.add(game_id)
@@ -369,4 +373,5 @@ if __name__ == "__main__":
         logger.info(f"Flushing final chunk — {len(chunk_plays)} play rows...")
         _flush(chunk_games, chunk_rosters, chunk_plays, chunk_tracking)
 
-    logger.info(f"Done. Processed={processed} | Skipped={skipped} | Errors={errors}")
+    logger.info(f"Done. Processed={processed} | Skipped={skipped} | "
+                f"Excluded game types={excluded} | Errors={errors}")

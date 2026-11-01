@@ -120,7 +120,7 @@ def write_live_snapshots(df, batch_id):
     from silver_parse import (
         GAMES_TABLE, ROSTERS_TABLE, PLAYS_TABLE,
         GAMES_SCHEMA, ROSTERS_SCHEMA, PLAYS_SCHEMA,
-        parse_game, parse_roster, parse_plays,
+        parse_game, parse_roster, parse_plays, is_silver_game,
     )
 
     session = df.sparkSession
@@ -161,11 +161,15 @@ def write_live_snapshots(df, batch_id):
     if not snapshots:
         return
 
-    # 3. Build silver rows with the same parser the nightly batch uses.
+    # 3. Build silver rows with the same parser the nightly batch uses. Game
+    #    types silver doesn't keep (e.g. the All-Star game) stay in live bronze.
     now = datetime.now()
-    games, rosters, plays = [], [], []
+    games, rosters, plays, kept_ids = [], [], [], []
     for snap in snapshots:
         data = json.loads(snap.raw_json)
+        if not is_silver_game(data):
+            continue
+        kept_ids.append(snap.game_id)
         games.append(parse_game(data, snap.fetched_at, "live", now))
         rosters.extend(parse_roster(data, "live", now))
         plays.extend(parse_plays(data, "live", now))
@@ -176,7 +180,9 @@ def write_live_snapshots(df, batch_id):
     #    games goes last, so a game row means its rosters and plays are in.
     #    replaceWhere only touches these games' files (tables are clustered on
     #    game_id) and only rows with source = 'live'.
-    ids_csv = ",".join(str(s.game_id) for s in snapshots)
+    if not kept_ids:
+        return
+    ids_csv = ",".join(str(g) for g in kept_ids)
     for rows, schema, table in [
         (rosters, ROSTERS_SCHEMA, ROSTERS_TABLE),
         (plays,   PLAYS_SCHEMA,   PLAYS_TABLE),

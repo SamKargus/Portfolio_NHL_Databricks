@@ -26,9 +26,15 @@ GAMES_TABLE   = "nhl.silver.games"
 ROSTERS_TABLE = "nhl.silver.game_rosters"
 PLAYS_TABLE   = "nhl.silver.nhl_plays"
 FINAL_STATES = {"OFF", "FINAL"}
+
+# Game types loaded into silver: 1 = preseason, 2 = regular season, 3 = playoffs.
+# Everything else stays in bronze only — 4 All-Star, 6/7/8 World Cup, 9 Olympics,
+# 10 Young Stars, 12 All-Stars exhibition, 13 2004 labor dispute lost games,
+# 14 Canada Cup, 18 overseas exhibition, 19 Four Nations Face-Off.
 SILVER_GAME_TYPES = {1, 2, 3}
 
 def is_silver_game(data: dict) -> bool:
+    """True if the game belongs in silver; a game with no gameType is excluded."""
     return _int(data.get("gameType")) in SILVER_GAME_TYPES
 
 # ----------------------------------------------------------------------
