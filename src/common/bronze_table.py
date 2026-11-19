@@ -32,27 +32,8 @@ def make_event_id(game_id: int, fetched_at: datetime) -> int:
     return (int(game_id) << 32) | (int(fetched_at.timestamp()) & 0xFFFFFFFF)
 
 
-def _ensure_catalog_and_schema(spark, logger) -> None:
-    """Create the nhl catalog (if allowed) and the nhl.bronze schema, for a fresh workspace."""
-    if not spark.sql("SHOW CATALOGS LIKE 'nhl'").collect():
-        try:
-            spark.sql("CREATE CATALOG IF NOT EXISTS nhl")
-            logger.info("Created catalog nhl")
-        except Exception as e:
-            msg = (
-                f"Catalog 'nhl' doesn't exist and this job couldn't create it ({type(e).__name__}: "
-                f"{str(e).splitlines()[0]}). Create it once in Catalog Explorer or SQL — "
-                f"`CREATE CATALOG nhl` (add `MANAGED LOCATION 's3://…'` if your metastore has no "
-                f"default storage) — or ask a workspace admin to, then re-run."
-            )
-            logger.error(msg)
-            raise RuntimeError(msg) from e
-    spark.sql("CREATE SCHEMA IF NOT EXISTS nhl.bronze")
-
-
 def ensure_bronze_table(spark, logger) -> None:
     """Create the bronze table if needed; refuse to run on the old IDENTITY layout."""
-    _ensure_catalog_and_schema(spark, logger)
     spark.sql(f"""
         CREATE TABLE IF NOT EXISTS {BRONZE_TABLE} (
             event_id BIGINT,
