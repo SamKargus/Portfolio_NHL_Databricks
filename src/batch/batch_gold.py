@@ -47,13 +47,6 @@ from datetime import datetime
 
 from pyspark.sql import functions as F, Window
 
-# Notebooks get `spark` injected; a job's Python script task may not.
-try:
-    spark  # noqa: F821
-except NameError:
-    from pyspark.sql import SparkSession
-    spark = SparkSession.builder.getOrCreate()
-
 # ----------------------------------------------------------------------
 # Setup (run once)
 # ----------------------------------------------------------------------

@@ -15,6 +15,3 @@ venv/
 
 # macOS
 .DS_Store
-
-# Databricks Asset Bundle local state
-.databricks/

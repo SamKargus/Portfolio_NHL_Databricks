@@ -6,27 +6,17 @@ from pathlib import Path
 from datetime import datetime
 from pyspark.sql.types import StructType, StructField, LongType, IntegerType, TimestampType
 
-# Shared silver parsing lives in src/common (the live pipeline uses it too).
-# Found from the script's own folder when run as a job file task (whose working
-# directory may be elsewhere), or from the working directory in a notebook.
+# Shared silver parsing lives in src/common (the live pipeline uses it too)
 _cwd = Path.cwd()
-_here = Path(__file__).resolve().parent if "__file__" in globals() else _cwd
 sys.path.insert(0, str(next(
-    (p / "src" / "common" for p in [_here, *_here.parents] if (p / "src" / "common").is_dir()),
-    _here,
+    (p / "src" / "common" for p in [_cwd, *_cwd.parents] if (p / "src" / "common").is_dir()),
+    _cwd,
 )))
 from silver_parse import (  # noqa: E402
     GAMES_TABLE, ROSTERS_TABLE, PLAYS_TABLE,
     GAMES_SCHEMA, ROSTERS_SCHEMA, PLAYS_SCHEMA,
     parse_game, parse_roster, parse_plays, is_silver_game,
 )
-
-# Notebooks get `spark` injected; a job's Python script task may not.
-try:
-    spark  # noqa: F821
-except NameError:
-    from pyspark.sql import SparkSession
-    spark = SparkSession.builder.getOrCreate()
 
 # ----------------------------------------------------------------------
 # Setup (run once)
