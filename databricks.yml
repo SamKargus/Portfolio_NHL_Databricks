@@ -1,0 +1,35 @@
+# Databricks Asset Bundle for the NHL pipeline.
+#
+#   databricks bundle validate
+#   databricks bundle deploy            # uploads src/ and creates/updates the job
+#   databricks bundle run nhl_batch     # runs bronze (parallel chunks) → silver → gold
+#
+# Needs the new Databricks CLI (v0.218+), authenticated to the workspace,
+# e.g. `databricks auth login --host https://<your-workspace>.cloud.databricks.com`.
+
+bundle:
+  name: nhl_pipeline
+
+include:
+  - resources/*.yml
+
+variables:
+  bronze_concurrency:
+    description: >-
+      How many bronze chunk tasks run at the same time. Each one makes its own
+      requests to the NHL API, so raising this raises the request rate too.
+      If the logs show lots of 429s, lower it.
+    default: 8
+
+targets:
+  dev:
+    mode: development    # job name gets a "[dev <you>]" prefix; schedules start paused
+    default: true
+    # workspace:
+    #   host: https://<your-workspace>.cloud.databricks.com
+
+  prod:
+    mode: production
+    # workspace:
+    #   host: https://<your-workspace>.cloud.databricks.com
+    #   root_path: /Workspace/Users/<you>/.bundle/${bundle.name}/${bundle.target}

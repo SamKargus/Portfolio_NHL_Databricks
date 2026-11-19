@@ -35,11 +35,16 @@ All layers are **Delta tables** stored in a Unity Catalog (`nhl`). Gold is built
 ## Project Structure
 
 ```
+├── databricks.yml            # Asset Bundle: deploys src/ and the batch job
+├── resources/
+│   └── nhl_batch_job.yml     # Job: parallel bronze chunks → silver → gold
 ├── src/
-│   └── batch/
-│       ├── batch_bronze.py   # Ingests raw JSON from the NHL API → bronze
-│       ├── batch_silver.py   # Parses and flattens bronze JSON → silver
-│       └── batch_gold.py     # Models bronze JSON into a star schema → gold
+│   ├── batch/
+│   │   ├── plan_bronze_chunks.py  # Splits 1916 → today into balanced date chunks
+│   │   ├── batch_bronze.py   # Ingests raw JSON for one date chunk → bronze
+│   │   ├── batch_silver.py   # Parses and flattens bronze JSON → silver
+│   │   └── batch_gold.py     # Models bronze JSON into a star schema → gold
+│   └── common/               # Code shared by the batch and live scripts
 ├── SQL/
 │   └── initTables/           # DDL notebooks for manual table setup
 ├── great_expectations/       # Data quality framework (in progress)
@@ -55,6 +60,23 @@ All layers are **Delta tables** stored in a Unity Catalog (`nhl`). Gold is built
 
 Fetches the complete play-by-play JSON payload from `https://api-web.nhle.com/v1` and writes it verbatim to the bronze Delta table. No parsing, no schema enforcement — raw vault.
 
+**Parallel backfill in date chunks**
+
+The full history (1916 → today, ~5,700 schedule weeks and every game since 1917) is loaded by the `nhl_batch_pipeline` job, not by one long-running script:
+
+```
+plan_bronze_chunks ──► bronze_chunks (for-each, 8 at a time) ──► silver ──► gold
+                         ├─ batch_bronze.py  1916-01-01 → 1936-05-06
+                         ├─ batch_bronze.py  1936-05-07 → 1955-03-14
+                         ├─ ...
+                         └─ batch_bronze.py  2023-06-21 → today
+```
+
+- `plan_bronze_chunks.py` splits the range into `num_chunks` (default 16) contiguous, non-overlapping date ranges. They are balanced by **estimated work**, not by length: a 1920s season has ~200 games and a modern one ~1,400, so early chunks span ~20 years and modern ones ~3–4. The chunks are passed to the next task as a task value.
+- A **for-each task** runs `batch_bronze.py --start_date=… --end_date=…` once per chunk, `bronze_concurrency` (default 8) at a time. Each chunk retries on its own if it fails.
+- Each chunk keeps only games **dated inside its own range** (the schedule endpoint returns a 7-day window that can cross a chunk boundary), so no two tasks ever fetch the same game.
+- All chunks append to the same table at once. Delta lets concurrent blind appends commit side by side, but an `IDENTITY` column turns that off, so `event_id` is computed by the writer instead: `game_id << 32 | unix seconds of the fetch`. It needs no coordination between tasks, is unique per fetch, and a newer fetch of the same game always gets a bigger id, so silver's "newest row per game wins" still holds.
+
 **How game IDs are collected**
 
 The NHL schedule endpoint (`/schedule/{date}`) returns a full `gameWeek` (7 days of games) per call. The script steps through the target date range **weekly** rather than daily to avoid fetching each game ID ~7 times.
@@ -69,7 +91,7 @@ Results are deduplicated with `dict.fromkeys()` before any processing begins.
 
 **Idempotency**
 
-Before the processing loop, the script queries `DISTINCT source` from the bronze table and skips any game whose URL is already present.
+Before the processing loop, the script queries `DISTINCT source` from the bronze table and skips any game whose URL is already present. Re-running the job (or a single failed chunk) only fetches what's missing.
 
 **Rate limiting**
 
@@ -79,7 +101,7 @@ Requests to the schedule endpoint use exponential backoff (up to 5 retries, `2^a
 
 | Column | Type | Description |
 |--------|------|-------------|
-| `event_id` | BIGINT IDENTITY | Surrogate key, auto-generated |
+| `event_id` | BIGINT | Row id set by the writer: `game_id << 32 \| fetch unix seconds` (rows loaded before the parallel job keep their old identity values 1, 2, 3, …) |
 | `ingestion_timestamp` | TIMESTAMP | Time the row was written |
 | `source` | STRING | Full API URL used to fetch the game |
 | `raw_json` | STRING | Complete JSON response from the API |
@@ -173,19 +195,44 @@ Primary consumer is **ad-hoc SQL / notebooks**. Older non-dimensional gold table
 - A catalog named `nhl` (or update the three-part table names in both scripts)
 - Python packages: `requests`, `pyspark` (both available in the Databricks runtime)
 
-### Running the pipeline
+### Running the pipeline (job)
 
-Run each script as a Databricks notebook or job. `spark` is assumed to be available in the session context.
+The whole batch pipeline is one Databricks job, deployed with an [Asset Bundle](https://docs.databricks.com/aws/en/dev-tools/bundles/) (needs the Databricks CLI v0.218+):
+
+```bash
+databricks bundle deploy             # uploads src/ and creates the job
+databricks bundle run nhl_batch      # 1916 → today: bronze chunks in parallel, then silver, then gold
+```
+
+| Job parameter | Default | Meaning |
+|---|---|---|
+| `start_date` | `1916-01-01` | First game day to load |
+| `end_date` | *(empty = today)* | Last game day to load |
+| `num_chunks` | `16` | How many date chunks to split the range into (short ranges get ~1 chunk per 60 days) |
+
+Bundle variable `bronze_concurrency` (default 8, in `databricks.yml`) sets how many chunks hit the NHL API at once. Lower it if the logs show many `429`s.
+
+For a nightly top-up, run the same job with `start_date` set to a few days back:
+
+```bash
+databricks bundle run nhl_batch --params start_date=2026-11-01
+```
+
+**Upgrading an existing bronze table.** Tables created before the parallel job have `event_id ... GENERATED ALWAYS AS IDENTITY`, which blocks concurrent appends. The scripts stop with these instructions; copying the table keeps every row and id, so silver's tracker stays valid:
+
+```sql
+CREATE TABLE nhl.bronze.nhl_events_v2 AS SELECT * FROM nhl.bronze.nhl_events;
+DROP TABLE nhl.bronze.nhl_events;
+ALTER TABLE nhl.bronze.nhl_events_v2 RENAME TO nhl.bronze.nhl_events;
+```
+
+### Running the scripts by hand
+
+Each script also runs on its own as a Databricks notebook or file. `spark` is used from the session when available.
 
 **Step 1 — Bronze ingestion**
 
-```python
-# In batch_bronze.py, set your date range:
-START_DATE = date(1917, 12, 1)
-END_DATE   = date.today()
-```
-
-Then run `batch_bronze.py`. On the first run this will take several hours to backfill the full history. Subsequent runs only process new games.
+`batch_bronze.py` takes `start_date` / `end_date` (notebook widgets or `--start_date=YYYY-MM-DD` arguments) and defaults to 1916-01-01 → today, so run on its own it loads the full history in one sequential pass (several hours). Subsequent runs only process new games.
 
 **Step 2 — Silver transformation**
 

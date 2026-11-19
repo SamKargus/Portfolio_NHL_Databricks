@@ -1,11 +1,56 @@
+"""
+Bronze ingestion — loads every final NHL game dated in [start_date, end_date]
+from the NHL API into nhl.bronze.nhl_events (raw JSON, one row per game).
+
+The full backfill (1916 → today) runs as many copies of this script at once,
+one per date chunk, from the job's for-each task (resources/nhl_batch_job.yml,
+chunks planned by plan_bronze_chunks.py). Run on its own it loads the whole
+range in one go.
+
+Parallel copies are safe:
+  * each keeps only games dated inside its own range, so chunks never overlap;
+  * they only append (blind appends don't conflict in Delta), and event_id is
+    computed here instead of by an IDENTITY column, which would block
+    concurrent writes (see src/common/bronze_table.py).
+
+Job parameters (notebook widgets, or --name=value task arguments):
+  start_date  first game day to load, YYYY-MM-DD (default 1916-01-01)
+  end_date    last game day to load, YYYY-MM-DD; empty = today
+"""
+
 import requests
 import logging
-import os
+import sys
 from pathlib import Path
 from datetime import datetime, date, timedelta
 import time
 import json
 from pyspark.sql import Row
+
+_here = Path(__file__).resolve().parent if "__file__" in globals() else Path.cwd()
+sys.path.insert(0, str(next(
+    (p / "src" / "common" for p in [_here, *_here.parents] if (p / "src" / "common").is_dir()),
+    _here,
+)))
+from bronze_table import BRONZE_TABLE, BRONZE_SCHEMA, ensure_bronze_table, make_event_id  # noqa: E402
+from job_params import get_param  # noqa: E402
+
+# Notebooks get `spark` injected; a job's Python script task may not.
+try:
+    spark  # noqa: F821
+except NameError:
+    from pyspark.sql import SparkSession
+    spark = SparkSession.builder.getOrCreate()
+
+# ----------------------------------------------------------------------
+# Date range for this run (one chunk of the backfill, or the whole thing)
+# ----------------------------------------------------------------------
+DEFAULT_START = date(1916, 1, 1)
+START_DATE = date.fromisoformat(get_param("start_date").strip() or DEFAULT_START.isoformat())
+_end_param = get_param("end_date").strip()
+END_DATE = date.fromisoformat(_end_param) if _end_param else date.today()
+if END_DATE < START_DATE:
+    raise ValueError(f"end_date {END_DATE} is before start_date {START_DATE}")
 
 # ----------------------------------------------------------------------
 # Setup (run once)
@@ -14,7 +59,9 @@ _cwd = Path.cwd()
 LOG_DIR = next((p / "logs" for p in [_cwd, *_cwd.parents] if (p / "logs").is_dir()), _cwd / "logs")
 LOG_DIR.mkdir(exist_ok=True)
 
-log_file = LOG_DIR / f"batch_bronze_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+# The range is in the name so parallel chunk tasks never share a log file
+log_file = LOG_DIR / (f"batch_bronze_{START_DATE:%Y%m%d}-{END_DATE:%Y%m%d}_"
+                      f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -24,7 +71,7 @@ logging.basicConfig(
     ],
 )
 logger = logging.getLogger("batch_bronze")
-logger.info(f"batch_bronze started — log: {log_file}")
+logger.info(f"batch_bronze started for {START_DATE} → {END_DATE} — log: {log_file}")
 
 BASE_URL = "https://api-web.nhle.com/v1"
 
@@ -48,18 +95,9 @@ PAUSE_STEP_ON_429_S = 0.2
 MAX_REQUEST_PAUSE_S = 3.0
 request_pause = REQUEST_PAUSE_S
 
-BRONZE_SCHEMA = "ingestion_timestamp TIMESTAMP, source STRING, raw_json STRING"
-
-# Ensure the target Delta table exists
-spark.sql("""
-    CREATE TABLE IF NOT EXISTS nhl.bronze.nhl_events (
-        event_id BIGINT GENERATED ALWAYS AS IDENTITY,
-        ingestion_timestamp TIMESTAMP,
-        source STRING,
-        raw_json STRING
-    ) USING DELTA
-""")
-logger.info("Table nhl.bronze.nhl_events is ready")
+# In the parallel job, plan_bronze_chunks already did this before the chunk
+# tasks started, so here it's a quick no-op check.
+ensure_bronze_table(spark, logger)
 
 # ----------------------------------------------------------------------
 # Core functions – fetch a single game, write games in batches
@@ -98,8 +136,10 @@ def fetch_game(game_id: str):
                 logger.info(f"Skipping game {game_id}: gameState={game_state} (not final yet)")
                 return None
 
+            fetched_at = datetime.now()
             return Row(
-                ingestion_timestamp=datetime.now(),
+                event_id=make_event_id(data["id"], fetched_at),
+                ingestion_timestamp=fetched_at,
                 source=url,
                 raw_json=json.dumps(data),
             )
@@ -124,8 +164,8 @@ def write_games(rows: list) -> None:
                 .write \
                 .format("delta") \
                 .mode("append") \
-                .saveAsTable("nhl.bronze.nhl_events")
-            logger.info(f"Inserted {len(rows)} games into nhl.bronze.nhl_events")
+                .saveAsTable(BRONZE_TABLE)
+            logger.info(f"Inserted {len(rows)} games into {BRONZE_TABLE}")
             return
         except Exception as e:
             if attempt == MAX_FLUSH_RETRIES:
@@ -140,11 +180,13 @@ def write_games(rows: list) -> None:
 # ----------------------------------------------------------------------
 # Helpers to discover game IDs
 # ----------------------------------------------------------------------
-def get_game_ids_for_day(d: date) -> list:
+def get_game_ids_for_day(d: date, last_day: date) -> list:
     """
-    Return game ID strings for finished games in the gameWeek starting at d.
-    The schedule endpoint returns 7 days from d, so near today it includes
-    future games — those are filtered out by FINAL_STATES.
+    Return game ID strings for finished games in the gameWeek starting at d,
+    keeping only days up to last_day. The schedule endpoint returns 7 days
+    from d, so without that cut-off a chunk would also pick up the first days
+    of the next chunk. Near today it includes future games — those are
+    filtered out by FINAL_STATES.
     """
     url = f"{BASE_URL}/schedule/{d.isoformat()}"
     for attempt in range(1, 6):
@@ -155,6 +197,7 @@ def get_game_ids_for_day(d: date) -> list:
                 return [
                     str(game["id"])
                     for gw in data.get("gameWeek", [])
+                    if d.isoformat() <= gw.get("date", "") <= last_day.isoformat()
                     for game in gw.get("games", [])
                     if game.get("gameState") in FINAL_STATES
                 ]
@@ -167,6 +210,7 @@ def get_game_ids_for_day(d: date) -> list:
         except Exception as e:
             logger.warning(f"Error fetching {d}: {e}, waiting before retry")
             time.sleep(2 ** attempt)
+    logger.error(f"Giving up on the schedule for the week of {d}; its games are missed this run")
     return []
 
 def get_all_game_ids(start: date, end: date) -> list:
@@ -174,7 +218,7 @@ def get_all_game_ids(start: date, end: date) -> list:
     ids = []
     current = start
     while current <= end:
-        week_ids = get_game_ids_for_day(current)
+        week_ids = get_game_ids_for_day(current, end)
         ids.extend(week_ids)
         logger.info(f"Week of {current} → {len(week_ids)} games")
         current += timedelta(weeks=1)
@@ -185,16 +229,12 @@ def get_all_game_ids(start: date, end: date) -> list:
 # Main execution
 # ----------------------------------------------------------------------
 if __name__ == "__main__":
-    # ----- Set your desired date range -----
-    START_DATE = date(1916, 1, 1)
-    END_DATE   = date.today()
-
     logger.info(f"Collecting game IDs from {START_DATE} to {END_DATE}")
     all_games = list(dict.fromkeys(get_all_game_ids(START_DATE, END_DATE)))
     logger.info(f"Total unique game IDs found: {len(all_games)}")
 
     # ----- Skip games already in the bronze table -----
-    existing_df = spark.sql("SELECT DISTINCT source FROM nhl.bronze.nhl_events")
+    existing_df = spark.sql(f"SELECT DISTINCT source FROM {BRONZE_TABLE}")
     # Assumes source stores the full URL (as used in process_game).
     existing_urls = {r.source for r in existing_df.collect() if r.source}
     new_games = [gid for gid in all_games
@@ -223,5 +263,5 @@ if __name__ == "__main__":
             write_games(buffer)
             success_count += len(buffer)
 
-    logger.info(f"Done. Successfully stored {success_count}/{len(new_games)} new games "
+    logger.info(f"Done ({START_DATE} → {END_DATE}). Successfully stored {success_count}/{len(new_games)} new games "
                 f"(pause between requests ended at {request_pause:.1f}s).")
